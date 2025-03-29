@@ -48,13 +48,15 @@ class Tokenizer {
 public:
     explicit Tokenizer(const std::string& input);
     Token getNextToken();
-    
+    // Global config - to use SIMD or not:
+    static bool UseSIMD;
     std::vector<Token> tokenize();
 
 
 private:
     std::string input;
     size_t position;
+    std::vector<Token> tokens;
 
     /*
     Tokensization methods: One for the usual, and one for the fallback:
@@ -73,8 +75,10 @@ private:
 
     char peek() const;
     char advance();
+
     void skipWhitespace();
     void skipComment();
+
     Token parseNumber();
     Token parseString();
     Token parseIdentifier();

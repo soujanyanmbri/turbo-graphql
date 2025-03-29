@@ -1,19 +1,34 @@
-cmake_minimum_required(VERSION 3.10)
-project(graphql_parser)
+cmake_minimum_required(VERSION 3.16)
+project(graphql_parser LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)  # Use C++17 or later
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Source files
-file(GLOB_RECURSE SOURCES src/*.cpp)
+# Enable optimization flags
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
 
-# Include directories
-include_directories(include)
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512)
+check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+check_cxx_compiler_flag("-msse4.2" COMPILER_SUPPORTS_SSE42)
+check_cxx_compiler_flag("-mavx512bw" COMPILER_SUPPORTS_AVX512BW)
 
-# Create the executable
+if (COMPILER_SUPPORTS_AVX512)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f")
+elseif (COMPILER_SUPPORTS_AVX2)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
+elseif (COMPILER_SUPPORTS_SSE42)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.2")
+elseif (COMPILER_SUPPORTS_AVX512BW)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512bw")
+endif()
+
+include_directories(${CMAKE_SOURCE_DIR}/include)
+
+file(GLOB_RECURSE SOURCES "src/*.cpp")
+
+# Place the compiled executable in the main project folder
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# Create executable
 add_executable(graphql_parser ${SOURCES})
-
-# Enable optimizations
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -Wall -Wextra -pedantic")
-
-# Add unit tests (if using GoogleTest later)
-enable_testing()
