@@ -82,6 +82,7 @@ private:
     Token parseNumber();
     Token parseString();
     Token parseIdentifier();
+    Token parseBoolean();
 };
 
 #endif // GRAPHQL_LEXER_H

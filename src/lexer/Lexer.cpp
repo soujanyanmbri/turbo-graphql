@@ -50,3 +50,20 @@ void Tokenizer::tokenizeFallback() {
 void Tokenizer::tokenizeSIMD() {
     
 }
+
+Token Tokenizer::parseString() {
+    return {TokenType::STRING, ""};    
+}
+
+Token Tokenizer::parseNumber() {
+    return {TokenType::NUMBER, ""};
+}
+
+Token Tokenizer::parseIdentifier() {
+    return {TokenType::IDENTIFIER, ""};
+}
+
+Token Tokenizer::parseBoolean() {
+    return {TokenType::BOOLEAN, ""};
+}
+    
