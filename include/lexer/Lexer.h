@@ -34,7 +34,8 @@ enum class TokenType {
     PIPE,            // |
 
     // End of input
-    END
+    END,
+    INVALID
 };
 
 // Token structure
@@ -73,6 +74,7 @@ private:
     void tokenizeSIMD();
     void tokenizeFallback();
 
+    bool shouldUseSIMD(const std::string& input, size_t position);
     char peek() const;
     char advance();
 
