@@ -25,10 +25,33 @@ endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-file(GLOB_RECURSE SOURCES "src/*.cpp")
+# Download and configure Google Test
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG release-1.12.1
+)
+FetchContent_MakeAvailable(googletest)
 
-# Place the compiled executable in the main project folder
+# Enable testing
+enable_testing()
+
+# Main executable sources (excluding test files)
+file(GLOB_RECURSE SOURCES "src/*.cpp")
+list(FILTER SOURCES EXCLUDE REGEX ".*_test\.cpp$")
+
+# Create main executable
+add_executable(graphql_parser ${SOURCES})
+
+# Test executable
+file(GLOB_RECURSE TEST_SOURCES "tests/*.cpp")
+add_executable(graphql_parser_tests ${TEST_SOURCES} ${SOURCES})
+target_link_libraries(graphql_parser_tests GTest::gtest_main GTest::gmock)
+
+# Place the compiled executables in the main project folder
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-# Create executable
-add_executable(graphql_parser ${SOURCES})
+# Register tests
+include(GoogleTest)
+gtest_discover_tests(graphql_parser_tests)

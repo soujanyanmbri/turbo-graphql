@@ -10,8 +10,8 @@ class SimdUtils {
 public:
     static void initialize();
     static int charMaskScalar(const char* data, char target);
-
-private:
+// Adding this to public for now for granular testing
+// private:
     static SIMDType activeSIMD;
     static SIMDCharMaskFunc charMask;
 

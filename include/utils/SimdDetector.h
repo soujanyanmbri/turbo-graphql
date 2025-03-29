@@ -8,7 +8,8 @@ enum class SIMDType {
     AVX2,
     SSE4_2,
     NEON,  // For ARM
-    SCALAR
+    SCALAR,
+    UNKNOWN
 };
 
 class SIMDDetector {
