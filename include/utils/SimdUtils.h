@@ -3,6 +3,7 @@
 
 #include "utils/SimdDetector.h"
 #include <cstdint>
+#include <cstddef>
 
 using SIMDCharMaskFunc = int (*)(const char*, char);
 
@@ -19,6 +20,12 @@ public:
     static int charMaskAVX512(const char* data, char target);
     static int charMaskAVX2(const char* data, char target);
     static int charMaskSSE(const char* data, char target);
+    static int keywordMaskSSE(const char* data, size_t len, const char* keywords[], const size_t NUM_KEYWORDS);
+    static int keywordMaskAVX2(const char* data, size_t len, const char* keywords[], const size_t NUM_KEYWORDS);
+#endif
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    static int charMaskNEON(const char* data, char target);
+    static int keywordMaskNEON(const char* data, size_t len, const char keywords[][16], const size_t NUM_KEYWORDS);
 #endif
 };
 
