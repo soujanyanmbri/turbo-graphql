@@ -16,7 +16,7 @@ enum class TokenType {
     COMMA,           // ,
     ELLIPSIS,        // ...
 
-    // Keywords & Identifiers
+    // Keywords & Identifiers - Added OPERATION, need to add the rest!! 
     OPERATION,       // query, mutation, subscription
     IDENTIFIER,      // Field, variable, type name
     TYPE_KEYWORD,    // type, enum, interface, union, input, scalar

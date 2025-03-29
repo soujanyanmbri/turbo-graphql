@@ -11,6 +11,7 @@ protected:
         SimdUtils::initialize();
     }
 
+    // Helper function to create a string with a specific character at a given position
     std::string createTestString(char target, size_t position) {
         std::string str(32, 'x');  // Fill with 'x'
         if (position < str.size()) {
@@ -19,10 +20,12 @@ protected:
         return str;
     }
 
+    // Helper to verify mask matches expected positions
     void verifyMask(const std::string& data, char target, const std::vector<size_t>& expectedPositions) {
         int mask = SimdUtils::charMask(data.c_str(), target);
         std::bitset<32> bits(mask);
         
+        // Check each expected position
         for (size_t pos : expectedPositions) {
             EXPECT_TRUE(bits.test(pos)) << "Expected target '" << target << "' at position " << pos;
         }
@@ -82,9 +85,13 @@ TEST_F(SimdUtilsTest, SpecialCharacters) {
 }
 
 TEST_F(SimdUtilsTest, BoundaryPositions) {
+    // Test first position
     verifyMask(createTestString('a', 0), 'a', {0});
+    
+    // Test last position
     verifyMask(createTestString('a', 31), 'a', {31});
     
+    // Test first and last positions together
     std::string data(32, 'x');
     data[0] = 'a';
     data[31] = 'a';
@@ -100,5 +107,6 @@ TEST_F(SimdUtilsTest, SimdTypeDetection) {
     EXPECT_TRUE(type == SIMDType::SCALAR || 
                 type == SIMDType::SSE4_2 || 
                 type == SIMDType::AVX2 || 
-                type == SIMDType::AVX512);
+                type == SIMDType::AVX512 || 
+                type == SIMDType::NEON);
 }

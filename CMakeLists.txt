@@ -15,43 +15,37 @@ check_cxx_compiler_flag("-mavx512bw" COMPILER_SUPPORTS_AVX512BW)
 
 if (COMPILER_SUPPORTS_AVX512)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f")
+elseif (COMPILER_SUPPORTS_AVX512BW)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512bw")
 elseif (COMPILER_SUPPORTS_AVX2)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
 elseif (COMPILER_SUPPORTS_SSE42)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.2")
-elseif (COMPILER_SUPPORTS_AVX512BW)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512bw")
 endif()
 
+# Include directories
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# Download and configure Google Test
-include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG release-1.12.1
-)
-FetchContent_MakeAvailable(googletest)
-
-# Enable testing
+file(GLOB_RECURSE SOURCES "src/*.cpp")
+list(REMOVE_ITEM SOURCES "${CMAKE_SOURCE_DIR}/src/main.cpp")
+add_library(graphql_core ${SOURCES})
+add_executable(graphql_parser src/main.cpp)
+target_link_libraries(graphql_parser PRIVATE graphql_core)
 enable_testing()
 
-# Main executable sources (excluding test files)
-file(GLOB_RECURSE SOURCES "src/*.cpp")
-list(FILTER SOURCES EXCLUDE REGEX ".*_test\.cpp$")
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+    DOWNLOAD_EXTRACT_TIMESTAMP true
+)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
 
-# Create main executable
-add_executable(graphql_parser ${SOURCES})
-
-# Test executable
+# Create test executable
 file(GLOB_RECURSE TEST_SOURCES "tests/*.cpp")
-add_executable(graphql_parser_tests ${TEST_SOURCES} ${SOURCES})
-target_link_libraries(graphql_parser_tests GTest::gtest_main GTest::gmock)
-
-# Place the compiled executables in the main project folder
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_executable(graphql_tests ${TEST_SOURCES})
+target_link_libraries(graphql_tests PRIVATE graphql_core gtest gtest_main)
 
 # Register tests
-include(GoogleTest)
-gtest_discover_tests(graphql_parser_tests)
+add_test(NAME GraphQLParserTests COMMAND graphql_tests)
