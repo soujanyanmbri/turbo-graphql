@@ -85,6 +85,11 @@ private:
     Token parseString();
     Token parseIdentifier();
     Token parseBoolean();
+    Token parseNull();
+    Token parseDirective();     // Parses @directive names.
+    Token parseFragment();      // Parses fragment declarations. Example: fragment on User
+    Token parseTypeKeyword();   // Parse Type keywords - type, interface etc
+    Token parseOperation();     // Parses GraphQL operations (query, mutation, subscription).
 };
 
-#endif // GRAPHQL_LEXER_H
+#endif
