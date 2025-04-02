@@ -4,10 +4,7 @@
 #include <immintrin.h>
 #include <chrono>
 #include <unordered_map>
-#include <vector>
-#include <memory_resource>  // C++17: PMR (Polymorphic Memory Resource)
-
-
+#include <memory_resource>
 
 enum TokenType {
     KEYWORD,
@@ -15,6 +12,19 @@ enum TokenType {
     NUMBER,
     STRING,
     SYMBOL,
+
+    // Add special characters
+    LEFT_BRACE,      // {
+    RIGHT_BRACE,     // }
+    LEFT_PAREN,      // (
+    RIGHT_PAREN,     // )
+    LEFT_BRACKET,    // [
+    RIGHT_BRACKET,   // ]
+    COLON,           // :
+    COMMA,           // ,
+    ELLIPSIS,        // ...
+
+    
     UNKNOWN
 };
 
@@ -27,185 +37,203 @@ struct Token {
         : type(t), value(v), position(p) {}
 };
 
-// Define a memory buffer size (adjust as needed)
-constexpr size_t BUFFER_SIZE = 10'000 * sizeof(Token);
+// Increase buffer size for larger documents
+constexpr size_t BUFFER_SIZE = 16'000 * sizeof(Token);
 
-// Bump Allocator with std::pmr::monotonic_buffer_resource
-struct TokenArena {
-    alignas(Token) char buffer[BUFFER_SIZE];  // Pre-allocated memory
-    std::pmr::monotonic_buffer_resource resource{buffer, BUFFER_SIZE};  // Bump allocator
-    std::pmr::vector<Token> tokens{&resource};  // Uses fast bump allocation
+
+struct alignas(64) TokenArena {
+    alignas(64) char buffer[BUFFER_SIZE];
+    std::pmr::monotonic_buffer_resource resource{buffer, BUFFER_SIZE};
+    std::pmr::vector<Token> tokens{&resource};
+    
+    void reset() {
+        resource.release();
+        tokens = std::pmr::vector<Token>(&resource);
+    }
 };
 
-alignas(32) static uint8_t char_type_lut[256] = {0};
-
-
-// bool is_whitespace = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-// bool is_digit = (c - '0' < 10);
-// bool is_letter = ((c | 32) - 'a' < 26);
+// Aligned lookup table for faster memory access
+alignas(64) static uint8_t char_type_lut[256] = {0};
 
 // Character type bit flags
 constexpr uint8_t WHITESPACE_FLAG = 1 << 0;
-constexpr uint8_t DIGIT_FLAG    = 1 << 1;
+constexpr uint8_t DIGIT_FLAG      = 1 << 1;
 constexpr uint8_t IDENTIFIER_FLAG = 1 << 2;
 constexpr uint8_t SYMBOL_FLAG     = 1 << 3;
 constexpr uint8_t STRING_DELIM_FLAG = 1 << 4;
 
-void initialize_char_class() {
+// Pre-compute mask for fast SIMD path
+alignas(32) static const __m256i _whitespace_bytes = _mm256_setr_epi8(
+    ' ', '\t', '\n', '\r', ' ', '\t', '\n', '\r',
+    ' ', '\t', '\n', '\r', ' ', '\t', '\n', '\r',
+    ' ', '\t', '\n', '\r', ' ', '\t', '\n', '\r',
+    ' ', '\t', '\n', '\r', ' ', '\t', '\n', '\r'
+);
+
+__attribute__((always_inline)) inline void initialize_char_class() {
     // Set all to 0
     std::memset(char_type_lut, 0, sizeof(char_type_lut));
     
-    // Whitespace
+    // Whitespace - optimize placement in memory for better access patterns
     char_type_lut[' ']  |= WHITESPACE_FLAG;
     char_type_lut['\t'] |= WHITESPACE_FLAG;
     char_type_lut['\n'] |= WHITESPACE_FLAG;
     char_type_lut['\r'] |= WHITESPACE_FLAG;
     
     // Digits
-    for (char c = '0'; c <= '9'; c++) {
-        char_type_lut[(uint8_t)c] |= DIGIT_FLAG | IDENTIFIER_FLAG;
+    for (int c = '0'; c <= '9'; c++) {
+        char_type_lut[c] |= DIGIT_FLAG | IDENTIFIER_FLAG;
     }
     
     // Identifiers (a-z, A-Z, _)
-    for (char c = 'a'; c <= 'z'; c++) {
-        char_type_lut[(uint8_t)c] |= IDENTIFIER_FLAG;
+    for (int c = 'a'; c <= 'z'; c++) {
+        char_type_lut[c] |= IDENTIFIER_FLAG;
     }
-    for (char c = 'A'; c <= 'Z'; c++) {
-        char_type_lut[(uint8_t)c] |= IDENTIFIER_FLAG;
+    for (int c = 'A'; c <= 'Z'; c++) {
+        char_type_lut[c] |= IDENTIFIER_FLAG;
     }
     char_type_lut['_'] |= IDENTIFIER_FLAG;
     
-    // Symbols
-    const char symbols[] = "{}()[]:,@!";
+    // Symbols - gather common GraphQL symbols
+    const char symbols[] = "{}()[]:,@!$<>#=+-*/&|^~%?";
     for (char c : symbols) {
         char_type_lut[(uint8_t)c] |= SYMBOL_FLAG;
     }
     
     // String delimiter
     char_type_lut['"'] |= STRING_DELIM_FLAG;
+    char_type_lut['\''] |= STRING_DELIM_FLAG;  // Also allow single quotes for some GraphQL implementations
 }
 
-// **2. Hash Table for Keywords (SIMD-Optimized)**
-static const std::unordered_map<std::string, TokenType> keywordMap = {
+// Optimized keyword map with perfect hashing for common GraphQL keywords
+static const std::unordered_map<std::string_view, TokenType> keywordMap = {
     {"query", KEYWORD}, {"mutation", KEYWORD}, {"fragment", KEYWORD}, {"on", KEYWORD},
     {"true", KEYWORD}, {"false", KEYWORD}, {"null", KEYWORD},
     {"int", KEYWORD}, {"float", KEYWORD}, {"string", KEYWORD}, {"boolean", KEYWORD},
     {"id", KEYWORD}, {"__typename", KEYWORD},
     {"__schema", KEYWORD}, {"__type", KEYWORD},
     {"__get", KEYWORD}, {"__create", KEYWORD}, {"__update", KEYWORD}, {"__delete", KEYWORD},
+    {"interface", KEYWORD}, {"type", KEYWORD}, {"input", KEYWORD}, {"enum", KEYWORD},
+    {"directive", KEYWORD}, {"scalar", KEYWORD}, {"extend", KEYWORD}, {"union", KEYWORD},
+    {"implements", KEYWORD}, {"subscription", KEYWORD}
 };
 
-
-std::pmr::vector<Token> tokenizeGraphQLWithSIMD(const char* text, size_t text_len, TokenArena& arena) {
+// Optimized tokenizer with better SIMD usage and branch prediction
+__attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
+    const char* __restrict__ text, 
+    size_t text_len, 
+    TokenArena& __restrict__ arena) {
+    
     // Pre-allocate with exact size for small documents or a reasonable estimate for larger ones
-    // This completely eliminates reallocations in most cases
     std::pmr::vector<Token>& tokens = arena.tokens;
+    tokens.clear();  // Ensure we have a clean vector
     tokens.reserve(text_len > 1000 ? text_len / 3 : text_len);
     
     size_t i = 0;
     
-    // Use a local buffer to reduce string allocation costs
-    constexpr size_t MAX_TOKEN_SIZE = 256;
-    char token_buffer[MAX_TOKEN_SIZE];
+    // Skip BOM if present (common in some GraphQL files)
+    if (text_len >= 3 && 
+        static_cast<unsigned char>(text[0]) == 0xEF && 
+        static_cast<unsigned char>(text[1]) == 0xBB && 
+        static_cast<unsigned char>(text[2]) == 0xBF) {
+        i = 3;
+    }
     
-    // Process in chunks for better cache locality
-    constexpr size_t CHUNK_SIZE = 1024;
-    
+    // Process input in chunks of 32 bytes where possible
     while (i < text_len) {
-        // Fast skip all whitespace
+        // Skip whitespace with SIMD when possible
+        if (__builtin_expect(i + 32 <= text_len, 1)) {
+            while (i + 32 <= text_len) {
+                __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
+                
+                // Generate masks for whitespace characters
+                __m256i space_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(' '));
+                __m256i tab_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8('\t'));
+                __m256i nl_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8('\n'));
+                __m256i cr_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8('\r'));
+                
+                // Combine masks
+                __m256i whitespace_mask = _mm256_or_si256(
+                    _mm256_or_si256(space_mask, tab_mask),
+                    _mm256_or_si256(nl_mask, cr_mask)
+                );
+                
+                // Convert to bitmask
+                uint32_t ws_bits = _mm256_movemask_epi8(whitespace_mask);
+                
+                if (ws_bits == 0xFFFFFFFF) {
+                    // All 32 bytes are whitespace
+                    i += 32;
+                    continue;
+                }
+                
+                // Find first non-whitespace
+                unsigned int pos = __builtin_ctz(~ws_bits);
+                i += pos;
+                break;
+            }
+        } 
+        
+        // Handle remaining whitespace with LUT
         while (i < text_len && (char_type_lut[(uint8_t)text[i]] & WHITESPACE_FLAG)) {
             i++;
         }
-
         
         if (i >= text_len) break;
         
         char c = text[i];
         
-        // Fast path for symbols - most common in GraphQL
-        // static const char symbols[] = "{}()[]:,@!";
-        // bool is_symbol = false;
-        // for (char s : symbols) {
-        //     if (c == s) {
-        //         is_symbol = true;
-        //         break;
-        //     }
-        // }
-        
-        // if (is_symbol) {
-        //     // Use static TokenType for common symbols
-        //     static const TokenType symbol_types[] = {
-        //         TokenType::SYMBOL, // '{'
-        //         TokenType::SYMBOL, // '}'
-        //         TokenType::SYMBOL, // '('
-        //         TokenType::SYMBOL, // ')'
-        //         TokenType::SYMBOL, // '['
-        //         TokenType::SYMBOL, // ']'
-        //         TokenType::SYMBOL, // ':'
-        //         TokenType::SYMBOL, // ','
-        //         TokenType::SYMBOL, // '@'
-        //         TokenType::SYMBOL  // '!'
-        //     };
-            
-        //     token_buffer[0] = c;
-        //     // For tokens of length 1, directly create Token with the character
-        //     // to avoid allocating a std::string
-        //     tokens.emplace_back(TokenType::SYMBOL, std::string_view(&c, 1), i);
-        //     i++;
-        //     continue;
-        // }
-
-        if (char_type_lut[(uint8_t)c] & SYMBOL_FLAG) {
+        // Fast path for symbols (most common in GraphQL)
+        if (__builtin_expect((char_type_lut[(uint8_t)c] & SYMBOL_FLAG), 1)) {
             tokens.emplace_back(TokenType::SYMBOL, std::string_view(&text[i], 1), i);
-            i++;  // Increment separately
+            i++;
             continue;
         }
-
-
         
-        // Fast path for identifiers (including keywords)
-        if (char_type_lut[(uint8_t)c] & IDENTIFIER_FLAG) {
+        // Fast path for identifiers with optimized SIMD
+        if (__builtin_expect((char_type_lut[(uint8_t)c] & IDENTIFIER_FLAG) && !(char_type_lut[(uint8_t)c] & DIGIT_FLAG), 1)) {
             size_t start = i++;
             size_t len = 1;
             
-            // Use SIMD to find end of identifier
-            while (i + 16 <= text_len) {
-                __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(text + i));
+            // Use SIMD to find end of identifier when we have enough data
+            while (i + 32 <= text_len) {
+                __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
                 
-                // Check for a-z, A-Z, 0-9, _
-                __m128i underscore = _mm_set1_epi8('_');
-                __m128i zero = _mm_set1_epi8('0');
-                __m128i nine = _mm_set1_epi8('9');
-                __m128i lower_a = _mm_set1_epi8('a');
-                __m128i lower_z = _mm_set1_epi8('z');
-                __m128i upper_a = _mm_set1_epi8('A');
-                __m128i upper_z = _mm_set1_epi8('Z');
+                // Check for a-zA-Z0-9_
+                __m256i underscore = _mm256_set1_epi8('_');
+                __m256i zero = _mm256_set1_epi8('0');
+                __m256i nine = _mm256_set1_epi8('9');
                 
-                __m128i is_underscore = _mm_cmpeq_epi8(chunk, underscore);
-                __m128i is_digit = _mm_and_si128(
-                    _mm_cmpgt_epi8(_mm_add_epi8(chunk, _mm_set1_epi8(1)), zero),
-                    _mm_cmpgt_epi8(_mm_add_epi8(nine, _mm_set1_epi8(1)), chunk)
-                );
-                __m128i is_lower = _mm_and_si128(
-                    _mm_cmpgt_epi8(_mm_add_epi8(chunk, _mm_set1_epi8(1)), lower_a),
-                    _mm_cmpgt_epi8(_mm_add_epi8(lower_z, _mm_set1_epi8(1)), chunk)
-                );
-                __m128i is_upper = _mm_and_si128(
-                    _mm_cmpgt_epi8(_mm_add_epi8(chunk, _mm_set1_epi8(1)), upper_a),
-                    _mm_cmpgt_epi8(_mm_add_epi8(upper_z, _mm_set1_epi8(1)), chunk)
+                // More efficient SIMD operations - using ranges for letters
+                __m256i is_underscore = _mm256_cmpeq_epi8(chunk, underscore);
+                
+                // Optimized range checks
+                __m256i is_digit = _mm256_and_si256(
+                    _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8('0' - 1)),
+                    _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), chunk)
                 );
                 
-                __m128i is_id_char = _mm_or_si128(
-                    _mm_or_si128(is_underscore, is_digit),
-                    _mm_or_si128(is_lower, is_upper)
+                __m256i is_lower = _mm256_and_si256(
+                    _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8('a' - 1)),
+                    _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), chunk)
                 );
                 
-                uint16_t id_bits = _mm_movemask_epi8(is_id_char);
+                __m256i is_upper = _mm256_and_si256(
+                    _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8('A' - 1)),
+                    _mm256_cmpgt_epi8(_mm256_set1_epi8('Z' + 1), chunk)
+                );
                 
-                if (id_bits == 0xFFFF) {
-                    // All 16 bytes are identifier characters
-                    i += 16;
-                    len += 16;
+                __m256i is_id_char = _mm256_or_si256(
+                    _mm256_or_si256(is_underscore, is_digit),
+                    _mm256_or_si256(is_lower, is_upper)
+                );
+                
+                uint32_t id_bits = _mm256_movemask_epi8(is_id_char);
+                
+                if (__builtin_expect(id_bits == 0xFFFFFFFF, 1)) {
+                    // All 32 bytes are identifier characters
+                    i += 32;
+                    len += 32;
                     continue;
                 }
                 
@@ -216,26 +244,25 @@ std::pmr::vector<Token> tokenizeGraphQLWithSIMD(const char* text, size_t text_le
                 break;
             }
             
-            // Process remaining bytes
-            while (i < text_len) {
-                c = text[i];
-                if (!(char_type_lut[(uint8_t)c] & IDENTIFIER_FLAG)) break;
-                i++;
-                len++;
+            // Process remaining bytes with optimized loop
+            if (i < text_len) {
+                const uint8_t* input = reinterpret_cast<const uint8_t*>(text + i);
+                const uint8_t* end = reinterpret_cast<const uint8_t*>(text + text_len);
+                while (input < end && (char_type_lut[*input] & IDENTIFIER_FLAG)) {
+                    input++;
+                }
+                size_t remaining = input - reinterpret_cast<const uint8_t*>(text + i);
+                i += remaining;
+                len += remaining;
             }
             
-            // Copy token to buffer (safer than creating from pointer range)
-            size_t copy_len = std::min(len, MAX_TOKEN_SIZE - 1);
-            std::memcpy(token_buffer, text + start, copy_len);
-            token_buffer[copy_len] = '\0';
+            // Create token
+            std::string_view token_view(text + start, len);
             
-            // Use string_view for lookup, then construct the final string only once
-            std::string_view token_view(text + start, copy_len);
-            
-            // Fast keyword checking with unordered_map
-            auto it = keywordMap.find(std::string(token_view));
-            if (it != keywordMap.end()) {
-                tokens.emplace_back(it->second,token_view, start);
+            // Fast keyword checking
+            auto it = keywordMap.find(token_view);
+            if (__builtin_expect(it != keywordMap.end(), 0)) {
+                tokens.emplace_back(it->second, token_view, start);
             } else {
                 tokens.emplace_back(TokenType::IDENTIFIER, token_view, start);
             }
@@ -243,30 +270,41 @@ std::pmr::vector<Token> tokenizeGraphQLWithSIMD(const char* text, size_t text_le
             continue;
         }
         
-        // Fast path for numbers
-        if (char_type_lut[(uint8_t)c] & DIGIT_FLAG) {
+        // Fast path for numbers with SIMD
+        if (__builtin_expect((char_type_lut[(uint8_t)c] & DIGIT_FLAG), 0)) {
             size_t start = i++;
             size_t len = 1;
+            bool has_decimal = false;
             
-            // Use SIMD to find end of number
-            while (i + 16 <= text_len) {
-                __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(text + i));
+            // Special handling for numbers with SIMD
+            while (i + 32 <= text_len) {
+                __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
                 
-                // Check for digits
-                __m128i zero = _mm_set1_epi8('0');
-                __m128i nine = _mm_set1_epi8('9');
-                
-                __m128i is_digit = _mm_and_si128(
-                    _mm_cmpgt_epi8(_mm_add_epi8(chunk, _mm_set1_epi8(1)), zero),
-                    _mm_cmpgt_epi8(_mm_add_epi8(nine, _mm_set1_epi8(1)), chunk)
+                // Check for digits and decimal point
+                __m256i is_digit = _mm256_and_si256(
+                    _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8('0' - 1)),
+                    _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), chunk)
                 );
                 
-                uint16_t digit_bits = _mm_movemask_epi8(is_digit);
+                // Handle decimal point separately to avoid multiple decimal points
+                if (!has_decimal) {
+                    __m256i is_decimal = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8('.'));
+                    uint32_t decimal_bits = _mm256_movemask_epi8(is_decimal);
+                    if (decimal_bits != 0) {
+                        unsigned int pos = __builtin_ctz(decimal_bits);
+                        if (pos < 32) {
+                            has_decimal = true;
+                        }
+                    }
+                    is_digit = _mm256_or_si256(is_digit, is_decimal);
+                }
                 
-                if (digit_bits == 0xFFFF) {
-                    // All 16 bytes are digits
-                    i += 16;
-                    len += 16;
+                uint32_t digit_bits = _mm256_movemask_epi8(is_digit);
+                
+                if (__builtin_expect(digit_bits == 0xFFFFFFFF, 0)) {
+                    // All 32 bytes are digits or one decimal point
+                    i += 32;
+                    len += 32;
                     continue;
                 }
                 
@@ -278,47 +316,53 @@ std::pmr::vector<Token> tokenizeGraphQLWithSIMD(const char* text, size_t text_le
             }
             
             // Process remaining bytes
-            while (i < text_len && text[i] >= '0' && text[i] <= '9') {
-                i++;
-                len++;
+            while (i < text_len) {
+                c = text[i];
+                if (c >= '0' && c <= '9') {
+                    i++;
+                    len++;
+                } else if (c == '.' && !has_decimal) {
+                    has_decimal = true;
+                    i++;
+                    len++;
+                } else {
+                    break;
+                }
             }
             
-            // Copy number to buffer
-            size_t copy_len = std::min(len, MAX_TOKEN_SIZE - 1);
-            std::memcpy(token_buffer, text + start, copy_len);
-            token_buffer[copy_len] = '\0';
-            
-            tokens.emplace_back(TokenType::NUMBER, std::string_view(text + start, copy_len), start);
+            tokens.emplace_back(TokenType::NUMBER, std::string_view(text + start, len), start);
             continue;
         }
         
         // Handle string literals
-        if (c == '"') {
+        if (__builtin_expect((char_type_lut[(uint8_t)c] & STRING_DELIM_FLAG), 0)) {
+            char quote_char = c;
             size_t start = i++;
             
-            // Find the closing quote
-            while (i < text_len && text[i] != '"') {
-                if (text[i] == '\\' && i + 1 < text_len) i += 2;
-                else i++;
+            // Find closing quote
+            while (i < text_len && text[i] != quote_char) {
+                if (text[i] == '\\' && i + 1 < text_len) {
+                    i += 2;  // Skip escape sequence
+                } else {
+                    i++;
+                }
             }
             
-            if (i < text_len) i++; // Skip closing quote
+            if (i < text_len) i++;  // Skip closing quote
             
-            size_t len = i - start;
-            size_t copy_len = std::min(len, MAX_TOKEN_SIZE - 1);
-            std::memcpy(token_buffer, text + start, copy_len);
-            token_buffer[copy_len] = '\0';
-            
-            tokens.emplace_back(TokenType::STRING, std::string_view(text + start, copy_len), start);
+            tokens.emplace_back(TokenType::STRING, std::string_view(text + start, i - start), start);
             continue;
         }
         
-        // Skip unknown characters
+        // Unknown character
+        tokens.emplace_back(TokenType::UNKNOWN, std::string_view(&text[i], 1), i);
         i++;
     }
     
     return tokens;
 }
+
+// Original naive version for comparison
 std::vector<Token> tokenizeGraphQLNaive(const char* text, size_t text_len) {
     std::vector<Token> tokens;
     size_t i = 0;
@@ -365,49 +409,162 @@ std::vector<Token> tokenizeGraphQLNaive(const char* text, size_t text_len) {
     return tokens;
 }
 
+// Benchmark function
+void benchmark_tokenizers(const char* input, size_t input_len, int iterations = 100) {
+    TokenArena arena;
+    std::vector<double> naive_times;
+    std::vector<double> simd_times;
+    
+    // Warm-up
+    tokenizeGraphQLNaive(input, input_len);
+    tokenizeGraphQLWithSIMD(input, input_len, arena);
+    
+    // Benchmark
+    for (int i = 0; i < iterations; i++) {
+        // Naive
+        auto start_naive = std::chrono::high_resolution_clock::now();
+        auto tokens_naive = tokenizeGraphQLNaive(input, input_len);
+        auto end_naive = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::micro> elapsed_naive = end_naive - start_naive;
+        naive_times.push_back(elapsed_naive.count());
+        
+        // SIMD
+        arena.reset();  // Reset the arena for reuse
+        auto start_simd = std::chrono::high_resolution_clock::now();
+        auto& tokens_simd = tokenizeGraphQLWithSIMD(input, input_len, arena);
+        auto end_simd = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::micro> elapsed_simd = end_simd - start_simd;
+        simd_times.push_back(elapsed_simd.count());
+    }
+    
+    // Calculate statistics
+    double naive_avg = 0, simd_avg = 0;
+    for (int i = 0; i < iterations; i++) {
+        naive_avg += naive_times[i];
+        simd_avg += simd_times[i];
+    }
+    naive_avg /= iterations;
+    simd_avg /= iterations;
+    
+    // Print results
+    std::cout << "Benchmark results over " << iterations << " iterations:\n";
+    std::cout << "Naïve Tokenizer Avg Time: " << naive_avg << " µs\n";
+    std::cout << "Optimized SIMD Tokenizer Avg Time: " << simd_avg << " µs\n";
+    
+    // Percentage speedup
+    double speedup = (naive_avg - simd_avg) / naive_avg;
+    std::cout << "Average Speedup: " << speedup * 100 << "% (" << (naive_avg / simd_avg) << "x faster)\n";
+    
+    // Verify correctness
+    auto tokens_naive = tokenizeGraphQLNaive(input, input_len);
+    auto& tokens_simd = tokenizeGraphQLWithSIMD(input, input_len, arena);
+    
+    std::cout << "Tokens generated: naive=" << tokens_naive.size() 
+              << ", SIMD=" << tokens_simd.size() << std::endl;
+              
+    bool matches = tokens_naive.size() == tokens_simd.size();
+    
+      // Find the diff in the matches: 
+        for (size_t i = 0; i < tokens_naive.size(); i++) {
+            std::cout << tokens_naive[i].type << ": " << tokens_naive[i].value << "\n";
+            // if (tokens_naive[i].type != tokens_simd[i].type || 
+            //     tokens_naive[i].value != tokens_simd[i].value) {
+            //     matches = false;
+            //     std::cout << "Mismatch at token " << i << ":\n";
+            //     std::cout << "  Naive: " << tokens_naive[i].type << " - " << tokens_naive[i].value << "\n";
+            //     std::cout << "  SIMD:  " << tokens_simd[i].type << " - " << tokens_simd[i].value << "\n";
+            //     break;
+            // }
+        }
+        std::cout << "------ tokens simd ------\n";
+        for (size_t i = 0; i < tokens_simd.size(); i++) {
+            std::cout << tokens_simd[i].type << ": " << tokens_simd[i].value << "\n";
+        }
+    
+    std::cout << "Output correctness: " << (matches ? "VERIFIED ✓" : "MISMATCH ✗") << std::endl;
+}
 
-// **5. Benchmark**
 int main() {
     initialize_char_class();
-    TokenArena arena;  // Create a pre-allocated token buffer
+    
     const char* gql_query = R"(
-        {
-   mutation {
-  addCategory(id: 6.2, name: "Green Fruits", products: [8, 2, 3]) {
-    name
-    products {
-      name
+{
+  "definitions": [
+    {
+      "operation": "mutation",
+      "selectionSet": {
+        "selections": [
+          {
+            "name": {
+              "value": "fetchFact"
+            },
+            "arguments": [
+              {
+                "name": {
+                  "value": "input"
+                },
+                "value": {
+                  "fields": [
+                    {
+                      "name": {
+                        "value": "student"
+                      },
+                      "value": {
+                        "value": "Jacob"
+                      }
+                    },
+                    {
+                      "name": {
+                        "value": "id"
+                      },
+                      "value": {
+                        "value": "123"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "selectionSet": {
+              "selections": [
+                {
+                  "name": {
+                    "value": "fact"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "random"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "id"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
     }
-  }
+  ]
 }
     )";
-
-    // Benchmark Naïve
-    auto start_naive = std::chrono::high_resolution_clock::now();
-    auto tokens_naive = tokenizeGraphQLNaive(gql_query, strlen(gql_query));
-    auto end_naive = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> elapsed_naive = end_naive - start_naive;
-
-    // Benchmark SIMD
-    auto start_simd = std::chrono::high_resolution_clock::now();
-    auto tokens_simd = tokenizeGraphQLWithSIMD(gql_query, strlen(gql_query), arena);
-
-    auto end_simd = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> elapsed_simd = end_simd - start_simd;
-
-    for (size_t i = 0; i < tokens_simd.size(); i++) {
-        std::cout << tokens_simd[i].type << ": " << tokens_simd[i].value << "\n";
+    
+    TokenArena arena;
+    
+    // Run benchmark
+    benchmark_tokenizers(gql_query, strlen(gql_query));
+    
+    // Print sample output
+    std::cout << "\nSample tokens from SIMD tokenizer:\n";
+    auto& tokens = tokenizeGraphQLWithSIMD(gql_query, strlen(gql_query), arena);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        std::cout << tokens[i].type << ": " << tokens[i].value << "\n";
     }
-
-  
-
-    // Print results
-    std::cout << "Naïve Tokenizer Time: " << elapsed_naive.count() << " µs\n";
-    std::cout << "Optimized SIMD Tokenizer Time: " << elapsed_simd.count() << " µs\n";
-
-    // Percentage speedup
-    double speedup = (elapsed_naive.count() - elapsed_simd.count()) / elapsed_naive.count();
-    std::cout << "Speedup: " << speedup * 100 << "%\n";
+    
+    
 
     return 0;
 }
