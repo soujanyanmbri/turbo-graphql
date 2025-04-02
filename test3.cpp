@@ -13,7 +13,7 @@ enum TokenType {
     STRING,
     SYMBOL,
 
-    // Add special characters
+    // Special characters with dedicated token types
     LEFT_BRACE,      // {
     RIGHT_BRACE,     // }
     LEFT_PAREN,      // (
@@ -23,7 +23,6 @@ enum TokenType {
     COLON,           // :
     COMMA,           // ,
     ELLIPSIS,        // ...
-
     
     UNKNOWN
 };
@@ -40,7 +39,6 @@ struct Token {
 // Increase buffer size for larger documents
 constexpr size_t BUFFER_SIZE = 16'000 * sizeof(Token);
 
-
 struct alignas(64) TokenArena {
     alignas(64) char buffer[BUFFER_SIZE];
     std::pmr::monotonic_buffer_resource resource{buffer, BUFFER_SIZE};
@@ -54,6 +52,8 @@ struct alignas(64) TokenArena {
 
 // Aligned lookup table for faster memory access
 alignas(64) static uint8_t char_type_lut[256] = {0};
+// New lookup table for specific token types
+alignas(64) static TokenType special_char_lut[256] = {(TokenType)0};
 
 // Character type bit flags
 constexpr uint8_t WHITESPACE_FLAG = 1 << 0;
@@ -61,6 +61,7 @@ constexpr uint8_t DIGIT_FLAG      = 1 << 1;
 constexpr uint8_t IDENTIFIER_FLAG = 1 << 2;
 constexpr uint8_t SYMBOL_FLAG     = 1 << 3;
 constexpr uint8_t STRING_DELIM_FLAG = 1 << 4;
+constexpr uint8_t SPECIAL_CHAR_FLAG = 1 << 5;
 
 // Pre-compute mask for fast SIMD path
 alignas(32) static const __m256i _whitespace_bytes = _mm256_setr_epi8(
@@ -73,6 +74,7 @@ alignas(32) static const __m256i _whitespace_bytes = _mm256_setr_epi8(
 __attribute__((always_inline)) inline void initialize_char_class() {
     // Set all to 0
     std::memset(char_type_lut, 0, sizeof(char_type_lut));
+    std::memset(special_char_lut, 0, sizeof(special_char_lut));
     
     // Whitespace - optimize placement in memory for better access patterns
     char_type_lut[' ']  |= WHITESPACE_FLAG;
@@ -94,8 +96,28 @@ __attribute__((always_inline)) inline void initialize_char_class() {
     }
     char_type_lut['_'] |= IDENTIFIER_FLAG;
     
-    // Symbols - gather common GraphQL symbols
-    const char symbols[] = "{}()[]:,@!$<>#=+-*/&|^~%?";
+    // Set up special characters
+    char_type_lut['{'] |= SPECIAL_CHAR_FLAG;
+    char_type_lut['}'] |= SPECIAL_CHAR_FLAG;
+    char_type_lut['('] |= SPECIAL_CHAR_FLAG;
+    char_type_lut[')'] |= SPECIAL_CHAR_FLAG;
+    char_type_lut['['] |= SPECIAL_CHAR_FLAG;
+    char_type_lut[']'] |= SPECIAL_CHAR_FLAG;
+    char_type_lut[':'] |= SPECIAL_CHAR_FLAG;
+    char_type_lut[','] |= SPECIAL_CHAR_FLAG;
+    
+    // Map special chars to token types
+    special_char_lut['{'] = LEFT_BRACE;
+    special_char_lut['}'] = RIGHT_BRACE;
+    special_char_lut['('] = LEFT_PAREN;
+    special_char_lut[')'] = RIGHT_PAREN;
+    special_char_lut['['] = LEFT_BRACKET;
+    special_char_lut[']'] = RIGHT_BRACKET;
+    special_char_lut[':'] = COLON;
+    special_char_lut[','] = COMMA;
+    
+    // Other symbols - gather remaining GraphQL symbols
+    const char symbols[] = "@!$<>#=+-*/&|^~%?";
     for (char c : symbols) {
         char_type_lut[(uint8_t)c] |= SYMBOL_FLAG;
     }
@@ -138,6 +160,18 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
         static_cast<unsigned char>(text[2]) == 0xBF) {
         i = 3;
     }
+
+    // Check for ellipsis sequence
+    auto checkEllipsis = [&](size_t pos) -> bool {
+        if (pos + 2 < text_len && 
+            text[pos] == '.' && 
+            text[pos + 1] == '.' && 
+            text[pos + 2] == '.') {
+            tokens.emplace_back(TokenType::ELLIPSIS, std::string_view(&text[pos], 3), pos);
+            return true;
+        }
+        return false;
+    };
     
     // Process input in chunks of 32 bytes where possible
     while (i < text_len) {
@@ -183,7 +217,21 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
         
         char c = text[i];
         
-        // Fast path for symbols (most common in GraphQL)
+        // Check for ellipsis first
+        if (c == '.' && checkEllipsis(i)) {
+            i += 3;
+            continue;
+        }
+        
+        // Fast path for special characters (now separate token types)
+        if (__builtin_expect((char_type_lut[(uint8_t)c] & SPECIAL_CHAR_FLAG), 1)) {
+            TokenType type = special_char_lut[(uint8_t)c];
+            tokens.emplace_back(type, std::string_view(&text[i], 1), i);
+            i++;
+            continue;
+        }
+        
+        // Fast path for regular symbols
         if (__builtin_expect((char_type_lut[(uint8_t)c] & SYMBOL_FLAG), 1)) {
             tokens.emplace_back(TokenType::SYMBOL, std::string_view(&text[i], 1), i);
             i++;
@@ -362,7 +410,7 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
     return tokens;
 }
 
-// Original naive version for comparison
+// Original naive version for comparison - updated to handle special tokens
 std::vector<Token> tokenizeGraphQLNaive(const char* text, size_t text_len) {
     std::vector<Token> tokens;
     size_t i = 0;
@@ -375,7 +423,47 @@ std::vector<Token> tokenizeGraphQLNaive(const char* text, size_t text_len) {
             continue;
         }
 
-        if (std::ispunct(c)) { 
+        // Check for ellipsis
+        if (c == '.' && i + 2 < text_len && text[i+1] == '.' && text[i+2] == '.') {
+            tokens.emplace_back(TokenType::ELLIPSIS, std::string(text + i, 3), i);
+            i += 3;
+            continue;
+        }
+
+        // Check for special characters
+        if (c == '{') {
+            tokens.emplace_back(TokenType::LEFT_BRACE, std::string(1, c), i);
+            i++;
+            continue;
+        } else if (c == '}') {
+            tokens.emplace_back(TokenType::RIGHT_BRACE, std::string(1, c), i);
+            i++;
+            continue;
+        } else if (c == '(') {
+            tokens.emplace_back(TokenType::LEFT_PAREN, std::string(1, c), i);
+            i++;
+            continue;
+        } else if (c == ')') {
+            tokens.emplace_back(TokenType::RIGHT_PAREN, std::string(1, c), i);
+            i++;
+            continue;
+        } else if (c == '[') {
+            tokens.emplace_back(TokenType::LEFT_BRACKET, std::string(1, c), i);
+            i++;
+            continue;
+        } else if (c == ']') {
+            tokens.emplace_back(TokenType::RIGHT_BRACKET, std::string(1, c), i);
+            i++;
+            continue;
+        } else if (c == ':') {
+            tokens.emplace_back(TokenType::COLON, std::string(1, c), i);
+            i++;
+            continue;
+        } else if (c == ',') {
+            tokens.emplace_back(TokenType::COMMA, std::string(1, c), i);
+            i++;
+            continue;
+        } else if (std::ispunct(c)) {
             tokens.emplace_back(TokenType::SYMBOL, std::string(1, c), i);
             i++;
             continue;
@@ -464,24 +552,51 @@ void benchmark_tokenizers(const char* input, size_t input_len, int iterations = 
               
     bool matches = tokens_naive.size() == tokens_simd.size();
     
-      // Find the diff in the matches: 
-        for (size_t i = 0; i < tokens_naive.size(); i++) {
-            std::cout << tokens_naive[i].type << ": " << tokens_naive[i].value << "\n";
-            // if (tokens_naive[i].type != tokens_simd[i].type || 
-            //     tokens_naive[i].value != tokens_simd[i].value) {
-            //     matches = false;
-            //     std::cout << "Mismatch at token " << i << ":\n";
-            //     std::cout << "  Naive: " << tokens_naive[i].type << " - " << tokens_naive[i].value << "\n";
-            //     std::cout << "  SIMD:  " << tokens_simd[i].type << " - " << tokens_simd[i].value << "\n";
-            //     break;
-            // }
+    // Find any differences in the output
+    if (tokens_naive.size() != tokens_simd.size()) {
+        std::cout << "Token count mismatch!\n";
+    } else {
+        for (size_t i = 0; i < tokens_naive.size() && i < tokens_simd.size(); i++) {
+            if (tokens_naive[i].type != tokens_simd[i].type || 
+                tokens_naive[i].value != tokens_simd[i].value) {
+                matches = false;
+                std::cout << "Mismatch at token " << i << ":\n";
+                std::cout << "  Naive: " << tokens_naive[i].type << " - " << tokens_naive[i].value << "\n";
+                std::cout << "  SIMD:  " << tokens_simd[i].type << " - " << tokens_simd[i].value << "\n";
+                break;
+            }
         }
-        std::cout << "------ tokens simd ------\n";
-        for (size_t i = 0; i < tokens_simd.size(); i++) {
-            std::cout << tokens_simd[i].type << ": " << tokens_simd[i].value << "\n";
-        }
+    }
     
     std::cout << "Output correctness: " << (matches ? "VERIFIED ✓" : "MISMATCH ✗") << std::endl;
+    
+    // Output token type names for human readability
+    auto tokenTypeName = [](TokenType type) -> std::string {
+        switch(type) {
+            case KEYWORD: return "KEYWORD";
+            case IDENTIFIER: return "IDENTIFIER";
+            case NUMBER: return "NUMBER";
+            case STRING: return "STRING";
+            case SYMBOL: return "SYMBOL";
+            case LEFT_BRACE: return "LEFT_BRACE";
+            case RIGHT_BRACE: return "RIGHT_BRACE";
+            case LEFT_PAREN: return "LEFT_PAREN";
+            case RIGHT_PAREN: return "RIGHT_PAREN";
+            case LEFT_BRACKET: return "LEFT_BRACKET";
+            case RIGHT_BRACKET: return "RIGHT_BRACKET";
+            case COLON: return "COLON";
+            case COMMA: return "COMMA";
+            case ELLIPSIS: return "ELLIPSIS";
+            default: return "UNKNOWN";
+        }
+    };
+    
+    // Print first few tokens for verification
+    std::cout << "\nSample tokens from SIMD tokenizer:\n";
+    size_t max_tokens = std::min(tokens_simd.size(), size_t(20));
+    for (size_t i = 0; i < max_tokens; i++) {
+        std::cout << tokenTypeName(tokens_simd[i].type) << ": " << tokens_simd[i].value << "\n";
+    }
 }
 
 int main() {
@@ -557,14 +672,34 @@ int main() {
     // Run benchmark
     benchmark_tokenizers(gql_query, strlen(gql_query));
     
-    // Print sample output
-    std::cout << "\nSample tokens from SIMD tokenizer:\n";
+    // Print sample output with token type names
+    std::cout << "\nFull token list from SIMD tokenizer:\n";
     auto& tokens = tokenizeGraphQLWithSIMD(gql_query, strlen(gql_query), arena);
+    
+    // Helper function to convert TokenType to string
+    auto getTokenTypeName = [](TokenType type) -> std::string {
+        switch(type) {
+            case KEYWORD: return "KEYWORD";
+            case IDENTIFIER: return "IDENTIFIER";
+            case NUMBER: return "NUMBER";
+            case STRING: return "STRING";
+            case SYMBOL: return "SYMBOL";
+            case LEFT_BRACE: return "LEFT_BRACE";
+            case RIGHT_BRACE: return "RIGHT_BRACE";
+            case LEFT_PAREN: return "LEFT_PAREN";
+            case RIGHT_PAREN: return "RIGHT_PAREN";
+            case LEFT_BRACKET: return "LEFT_BRACKET";
+            case RIGHT_BRACKET: return "RIGHT_BRACKET";
+            case COLON: return "COLON";
+            case COMMA: return "COMMA";
+            case ELLIPSIS: return "ELLIPSIS";
+            default: return "UNKNOWN";
+        }
+    };
+    
     for (size_t i = 0; i < tokens.size(); i++) {
-        std::cout << tokens[i].type << ": " << tokens[i].value << "\n";
+        std::cout << getTokenTypeName(tokens[i].type) << ": " << tokens[i].value << "\n";
     }
     
-    
-
     return 0;
 }
