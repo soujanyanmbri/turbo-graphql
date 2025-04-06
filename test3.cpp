@@ -223,7 +223,7 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
             continue;
         }
         
-        // Fast path for special characters (now separate token types)
+        // Fast path for special characters
         if (__builtin_expect((char_type_lut[(uint8_t)c] & SPECIAL_CHAR_FLAG), 1)) {
             TokenType type = special_char_lut[(uint8_t)c];
             tokens.emplace_back(type, std::string_view(&text[i], 1), i);
@@ -604,7 +604,7 @@ int main() {
     
     const char* gql_query = R"(
 {
-  "definitions": [
+  query: [
     {
       "operation": "mutation",
       "selectionSet": {
@@ -675,7 +675,7 @@ int main() {
     // Print sample output with token type names
     std::cout << "\nFull token list from SIMD tokenizer:\n";
     auto& tokens = tokenizeGraphQLWithSIMD(gql_query, strlen(gql_query), arena);
-    
+
     // Helper function to convert TokenType to string
     auto getTokenTypeName = [](TokenType type) -> std::string {
         switch(type) {
@@ -699,6 +699,13 @@ int main() {
     
     for (size_t i = 0; i < tokens.size(); i++) {
         std::cout << getTokenTypeName(tokens[i].type) << ": " << tokens[i].value << "\n";
+    }
+
+    std::cout << "\n FUll token list from naive tokenizer:\n";
+    auto tokens_naive = tokenizeGraphQLNaive(gql_query, strlen(gql_query));
+    
+    for (size_t i = 0; i < tokens_naive.size(); i++) {
+        std::cout << getTokenTypeName(tokens_naive[i].type) << ": " << &tokens_naive[i].value << "\n";
     }
     
     return 0;
