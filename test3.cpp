@@ -5,14 +5,20 @@
 #include <chrono>
 #include <unordered_map>
 #include <memory_resource>
+#include <numeric>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
 
 enum TokenType {
     KEYWORD,
     IDENTIFIER,
+    VARIABLE,
+    DIRECTIVE,
+
     NUMBER,
     STRING,
     SYMBOL,
-
     // Special characters with dedicated token types
     LEFT_BRACE,      // {
     RIGHT_BRACE,     // }
@@ -23,7 +29,12 @@ enum TokenType {
     COLON,           // :
     COMMA,           // ,
     ELLIPSIS,        // ...
+    EXCLAMATION,      // !
     
+    // TODO: 
+    BOOLEAN,
+    NULL_VALUE,
+
     UNKNOWN
 };
 
@@ -62,6 +73,7 @@ constexpr uint8_t IDENTIFIER_FLAG = 1 << 2;
 constexpr uint8_t SYMBOL_FLAG     = 1 << 3;
 constexpr uint8_t STRING_DELIM_FLAG = 1 << 4;
 constexpr uint8_t SPECIAL_CHAR_FLAG = 1 << 5;
+constexpr uint8_t COMMENT_FLAG      = 1 << 6;  // New flag for comment characters
 
 // Pre-compute mask for fast SIMD path
 alignas(32) static const __m256i _whitespace_bytes = _mm256_setr_epi8(
@@ -96,6 +108,9 @@ __attribute__((always_inline)) inline void initialize_char_class() {
     }
     char_type_lut['_'] |= IDENTIFIER_FLAG;
     
+    // Comment character
+    char_type_lut['/'] |= COMMENT_FLAG;
+    
     // Set up special characters
     char_type_lut['{'] |= SPECIAL_CHAR_FLAG;
     char_type_lut['}'] |= SPECIAL_CHAR_FLAG;
@@ -105,7 +120,8 @@ __attribute__((always_inline)) inline void initialize_char_class() {
     char_type_lut[']'] |= SPECIAL_CHAR_FLAG;
     char_type_lut[':'] |= SPECIAL_CHAR_FLAG;
     char_type_lut[','] |= SPECIAL_CHAR_FLAG;
-    
+    char_type_lut['!'] |= SPECIAL_CHAR_FLAG;
+
     // Map special chars to token types
     special_char_lut['{'] = LEFT_BRACE;
     special_char_lut['}'] = RIGHT_BRACE;
@@ -115,6 +131,7 @@ __attribute__((always_inline)) inline void initialize_char_class() {
     special_char_lut[']'] = RIGHT_BRACKET;
     special_char_lut[':'] = COLON;
     special_char_lut[','] = COMMA;
+    special_char_lut['!'] = EXCLAMATION;
     
     // Other symbols - gather remaining GraphQL symbols
     const char symbols[] = "@!$<>#=+-*/&|^~%?";
@@ -139,6 +156,89 @@ static const std::unordered_map<std::string_view, TokenType> keywordMap = {
     {"directive", KEYWORD}, {"scalar", KEYWORD}, {"extend", KEYWORD}, {"union", KEYWORD},
     {"implements", KEYWORD}, {"subscription", KEYWORD}
 };
+
+// Fast SIMD-based comment skipping
+__attribute__((always_inline)) inline size_t skip_comments_simd(const char* __restrict__ text, size_t i, size_t text_len) {
+    if (i + 1 >= text_len) return i;
+    
+    // Check for single-line comment
+    if (text[i] == '/' && text[i + 1] == '/') {
+        i += 2; // Skip '//'
+        
+        // Use SIMD to find end of line
+        while (i + 32 <= text_len) {
+            __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
+            
+            // Check for newline characters
+            __m256i nl_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8('\n'));
+            uint32_t nl_bits = _mm256_movemask_epi8(nl_mask);
+            
+            if (nl_bits == 0) {
+                // No newline in this chunk
+                i += 32;
+                continue;
+            }
+            
+            // Found newline
+            unsigned int pos = __builtin_ctz(nl_bits);
+            i += pos + 1; // Skip to character after newline
+            return i;
+        }
+        
+        // Linear search for end of line if less than 32 chars remaining
+        while (i < text_len && text[i] != '\n') {
+            i++;
+        }
+        if (i < text_len) i++; // Skip the newline character
+        return i;
+    }
+    
+    // Check for multi-line comment
+    if (text[i] == '/' && text[i + 1] == '*') {
+        i += 2; // Skip '/*'
+        
+        // Use SIMD to efficiently search for "*/"
+        while (i + 32 <= text_len) {
+            __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
+            
+            // Look for '*' characters
+            __m256i asterisk_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8('*'));
+            uint32_t asterisk_bits = _mm256_movemask_epi8(asterisk_mask);
+            
+            // If no '*' in this chunk, continue searching
+            if (asterisk_bits == 0) {
+                i += 32;
+                continue;
+            }
+            
+            // Check each '*' to see if it's followed by '/'
+            while (asterisk_bits) {
+                unsigned int pos = __builtin_ctz(asterisk_bits);
+                asterisk_bits &= asterisk_bits - 1; // Clear the least significant bit
+                
+                if (i + pos + 1 < text_len && text[i + pos + 1] == '/') {
+                    return i + pos + 2; // Skip past "*/"
+                }
+            }
+            
+            // No matching "*/" found in this chunk, advance but keep one character for overlap
+            i += 31;
+        }
+        
+        // Linear scan for the remaining characters
+        while (i + 1 < text_len) {
+            if (text[i] == '*' && text[i + 1] == '/') {
+                return i + 2;
+            }
+            i++;
+        }
+        
+        // If we reach here, the comment wasn't closed properly
+        return text_len;
+    }
+    
+    return i;
+}
 
 // Optimized tokenizer with better SIMD usage and branch prediction
 __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
@@ -217,9 +317,39 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
         
         char c = text[i];
         
-        // Check for ellipsis first
+        // Check for comments first (optimized with SIMD)
+        if (c == '/' && i + 1 < text_len && (text[i + 1] == '/' || text[i + 1] == '*')) {
+            i = skip_comments_simd(text, i, text_len);
+            continue;
+        }
+        
+        // Check for ellipsis next
         if (c == '.' && checkEllipsis(i)) {
             i += 3;
+            continue;
+        }
+
+        if (c == '$' && i + 1 < text_len && (char_type_lut[(uint8_t)text[i+1]] & IDENTIFIER_FLAG)) {
+            size_t start = i++;
+            size_t len = 1;
+            
+            while (i < text_len && (char_type_lut[(uint8_t)text[i]] & IDENTIFIER_FLAG)) {
+                i++;
+                len++;
+            }
+            tokens.emplace_back(TokenType::VARIABLE, std::string_view(text + start, len), start);
+            continue;
+        }
+
+        if (c == '@' && i + 1 < text_len && (char_type_lut[(uint8_t)text[i+1]] & IDENTIFIER_FLAG)) {
+            size_t start = i++;
+            size_t len = 1;
+            
+            while (i < text_len && (char_type_lut[(uint8_t)text[i]] & IDENTIFIER_FLAG)) {
+                i++;
+                len++;
+            }
+            tokens.emplace_back(TokenType::DIRECTIVE, std::string_view(text + start, len), start);
             continue;
         }
         
@@ -230,7 +360,7 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
             i++;
             continue;
         }
-        
+
         // Fast path for regular symbols
         if (__builtin_expect((char_type_lut[(uint8_t)c] & SYMBOL_FLAG), 1)) {
             tokens.emplace_back(TokenType::SYMBOL, std::string_view(&text[i], 1), i);
@@ -402,7 +532,6 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
             continue;
         }
         
-        // Unknown character
         tokens.emplace_back(TokenType::UNKNOWN, std::string_view(&text[i], 1), i);
         i++;
     }
@@ -410,7 +539,7 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
     return tokens;
 }
 
-// Original naive version for comparison - updated to handle special tokens
+// Original naive version for comparison - updated to handle special tokens and comments
 std::vector<Token> tokenizeGraphQLNaive(const char* text, size_t text_len) {
     std::vector<Token> tokens;
     size_t i = 0;
@@ -421,6 +550,25 @@ std::vector<Token> tokenizeGraphQLNaive(const char* text, size_t text_len) {
         if (std::isspace(c)) {
             i++;
             continue;
+        }
+        
+        // Handle comments
+        if (c == '/' && i + 1 < text_len) {
+            if (text[i + 1] == '/') {  // Single-line comment
+                i += 2;
+                while (i < text_len && text[i] != '\n') {
+                    i++;
+                }
+                if (i < text_len) i++;  // Skip newline
+                continue;
+            } else if (text[i + 1] == '*') {  // Multi-line comment
+                i += 2;
+                while (i + 1 < text_len && !(text[i] == '*' && text[i + 1] == '/')) {
+                    i++;
+                }
+                if (i + 1 < text_len) i += 2;  // Skip */
+                continue;
+            }
         }
 
         // Check for ellipsis
@@ -471,7 +619,17 @@ std::vector<Token> tokenizeGraphQLNaive(const char* text, size_t text_len) {
 
         if (std::isdigit(c)) {
             size_t start = i;
-            while (i < text_len && std::isdigit(text[i])) i++;
+            bool has_decimal = false;
+            while (i < text_len) {
+                if (std::isdigit(text[i])) {
+                    i++;
+                } else if (text[i] == '.' && !has_decimal) {
+                    has_decimal = true;
+                    i++;
+                } else {
+                    break;
+                }
+            }
             tokens.emplace_back(TokenType::NUMBER, std::string(text + start, i - start), start);
             continue;
         }
@@ -497,107 +655,85 @@ std::vector<Token> tokenizeGraphQLNaive(const char* text, size_t text_len) {
     return tokens;
 }
 
-// Benchmark function
+
 void benchmark_tokenizers(const char* input, size_t input_len, int iterations = 100) {
     TokenArena arena;
     std::vector<double> naive_times;
     std::vector<double> simd_times;
-    
-    // Warm-up
-    tokenizeGraphQLNaive(input, input_len);
-    tokenizeGraphQLWithSIMD(input, input_len, arena);
-    
-    // Benchmark
+
+    // --- Warm-up run to stabilize cache/branch prediction ---
+    for (int i = 0; i < 10; i++) {
+        tokenizeGraphQLNaive(input, input_len);
+        tokenizeGraphQLWithSIMD(input, input_len, arena);
+    }
+
+    // --- Benchmark Loop ---
     for (int i = 0; i < iterations; i++) {
         // Naive
         auto start_naive = std::chrono::high_resolution_clock::now();
         auto tokens_naive = tokenizeGraphQLNaive(input, input_len);
         auto end_naive = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::micro> elapsed_naive = end_naive - start_naive;
-        naive_times.push_back(elapsed_naive.count());
-        
+        naive_times.push_back(std::chrono::duration<double, std::micro>(end_naive - start_naive).count());
+
         // SIMD
-        arena.reset();  // Reset the arena for reuse
+        arena.reset();
         auto start_simd = std::chrono::high_resolution_clock::now();
         auto& tokens_simd = tokenizeGraphQLWithSIMD(input, input_len, arena);
         auto end_simd = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::micro> elapsed_simd = end_simd - start_simd;
-        simd_times.push_back(elapsed_simd.count());
+        simd_times.push_back(std::chrono::duration<double, std::micro>(end_simd - start_simd).count());
     }
-    
-    // Calculate statistics
-    double naive_avg = 0, simd_avg = 0;
-    for (int i = 0; i < iterations; i++) {
-        naive_avg += naive_times[i];
-        simd_avg += simd_times[i];
-    }
-    naive_avg /= iterations;
-    simd_avg /= iterations;
-    
-    // Print results
-    std::cout << "Benchmark results over " << iterations << " iterations:\n";
-    std::cout << "Naïve Tokenizer Avg Time: " << naive_avg << " µs\n";
-    std::cout << "Optimized SIMD Tokenizer Avg Time: " << simd_avg << " µs\n";
-    
-    // Percentage speedup
-    double speedup = (naive_avg - simd_avg) / naive_avg;
-    std::cout << "Average Speedup: " << speedup * 100 << "% (" << (naive_avg / simd_avg) << "x faster)\n";
-    
-    // Verify correctness
+
+    auto stats = [](std::vector<double>& times) {
+        std::sort(times.begin(), times.end());
+        double avg = std::accumulate(times.begin(), times.end(), 0.0) / times.size();
+        double med = times[times.size() / 2];
+        double min = times.front();
+        double max = times.back();
+        double stdev = std::sqrt(std::accumulate(times.begin(), times.end(), 0.0, [&](double acc, double val) {
+            return acc + (val - avg) * (val - avg);
+        }) / times.size());
+
+        return std::tuple{avg, med, min, max, stdev};
+    };
+
+    auto [avg_naive, med_naive, min_naive, max_naive, stdev_naive] = stats(naive_times);
+    auto [avg_simd, med_simd, min_simd, max_simd, stdev_simd] = stats(simd_times);
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\n📊 Benchmark Results (µs) over " << iterations << " iterations:\n";
+    std::cout << "──────────────────────────────────────────────\n";
+    std::cout << "Tokenizer   | Avg     | Median  | Min     | Max     | StdDev\n";
+    std::cout << "------------|---------|---------|---------|---------|--------\n";
+    std::cout << "Naive       | " << avg_naive << " | " << med_naive << " | " << min_naive
+              << " | " << max_naive << " | " << stdev_naive << "\n";
+    std::cout << "SIMD        | " << avg_simd << " | " << med_simd << " | " << min_simd
+              << " | " << max_simd << " | " << stdev_simd << "\n";
+
+    double speedup = avg_naive / avg_simd;
+    std::cout << "\n🚀 Speedup: " << (speedup - 1.0) * 100.0 << "% faster (" << speedup << "x)\n";
+
+    // Correctness check (optional)
     auto tokens_naive = tokenizeGraphQLNaive(input, input_len);
     auto& tokens_simd = tokenizeGraphQLWithSIMD(input, input_len, arena);
-    
-    std::cout << "Tokens generated: naive=" << tokens_naive.size() 
-              << ", SIMD=" << tokens_simd.size() << std::endl;
-              
     bool matches = tokens_naive.size() == tokens_simd.size();
-    
-    // Find any differences in the output
-    if (tokens_naive.size() != tokens_simd.size()) {
-        std::cout << "Token count mismatch!\n";
+
+    if (!matches) {
+        std::cout << "❌ Token count mismatch! naive=" << tokens_naive.size()
+                  << " simd=" << tokens_simd.size() << "\n";
     } else {
-        for (size_t i = 0; i < tokens_naive.size() && i < tokens_simd.size(); i++) {
-            if (tokens_naive[i].type != tokens_simd[i].type || 
-                tokens_naive[i].value != tokens_simd[i].value) {
+        for (size_t i = 0; i < tokens_naive.size(); i++) {
+            if (tokens_naive[i].type != tokens_simd[i].type || tokens_naive[i].value != tokens_simd[i].value) {
+                std::cout << "❌ Mismatch at token " << i << "\n";
+                std::cout << "   Naive: " << tokens_naive[i].value << "\n";
+                std::cout << "   SIMD : " << tokens_simd[i].value << "\n";
                 matches = false;
-                std::cout << "Mismatch at token " << i << ":\n";
-                std::cout << "  Naive: " << tokens_naive[i].type << " - " << tokens_naive[i].value << "\n";
-                std::cout << "  SIMD:  " << tokens_simd[i].type << " - " << tokens_simd[i].value << "\n";
                 break;
             }
         }
     }
-    
-    std::cout << "Output correctness: " << (matches ? "VERIFIED ✓" : "MISMATCH ✗") << std::endl;
-    
-    // Output token type names for human readability
-    auto tokenTypeName = [](TokenType type) -> std::string {
-        switch(type) {
-            case KEYWORD: return "KEYWORD";
-            case IDENTIFIER: return "IDENTIFIER";
-            case NUMBER: return "NUMBER";
-            case STRING: return "STRING";
-            case SYMBOL: return "SYMBOL";
-            case LEFT_BRACE: return "LEFT_BRACE";
-            case RIGHT_BRACE: return "RIGHT_BRACE";
-            case LEFT_PAREN: return "LEFT_PAREN";
-            case RIGHT_PAREN: return "RIGHT_PAREN";
-            case LEFT_BRACKET: return "LEFT_BRACKET";
-            case RIGHT_BRACKET: return "RIGHT_BRACKET";
-            case COLON: return "COLON";
-            case COMMA: return "COMMA";
-            case ELLIPSIS: return "ELLIPSIS";
-            default: return "UNKNOWN";
-        }
-    };
-    
-    // Print first few tokens for verification
-    std::cout << "\nSample tokens from SIMD tokenizer:\n";
-    size_t max_tokens = std::min(tokens_simd.size(), size_t(20));
-    for (size_t i = 0; i < max_tokens; i++) {
-        std::cout << tokenTypeName(tokens_simd[i].type) << ": " << tokens_simd[i].value << "\n";
-    }
+    std::cout << "✅ Output correctness: " << (matches ? "VERIFIED ✓" : "FAILED ✗") << "\n";
 }
+
 
 int main() {
     initialize_char_class();
@@ -611,7 +747,7 @@ int main() {
         "selections": [
           {
             "name": {
-              "value": "fetchFact"
+              @testDirective : "fetchFact"
             },
             "arguments": [
               {
@@ -633,7 +769,7 @@ int main() {
                         "value": "id"
                       },
                       "value": {
-                        "value": "123"
+                        "value": 123
                       }
                     }
                   ]
@@ -649,14 +785,14 @@ int main() {
                 },
                 {
                   "name": {
-                    "value": "random"
+                    "value": $random
                   }
                 },
                 {
                   "name": {
-                    "value": "id"
+                    ID!: "id"
                   }
-                }
+                },
               ]
             }
           }
@@ -682,10 +818,13 @@ int main() {
             case KEYWORD: return "KEYWORD";
             case IDENTIFIER: return "IDENTIFIER";
             case NUMBER: return "NUMBER";
+            case VARIABLE: return "VARIABLE";
+            case DIRECTIVE: return "DIRECTIVE";
             case STRING: return "STRING";
             case SYMBOL: return "SYMBOL";
             case LEFT_BRACE: return "LEFT_BRACE";
             case RIGHT_BRACE: return "RIGHT_BRACE";
+            case EXCLAMATION: return "EXCLAMATION";
             case LEFT_PAREN: return "LEFT_PAREN";
             case RIGHT_PAREN: return "RIGHT_PAREN";
             case LEFT_BRACKET: return "LEFT_BRACKET";
@@ -697,16 +836,16 @@ int main() {
         }
     };
     
-    for (size_t i = 0; i < tokens.size(); i++) {
-        std::cout << getTokenTypeName(tokens[i].type) << ": " << tokens[i].value << "\n";
-    }
+    // for (size_t i = 0; i < tokens.size(); i++) {
+    //     std::cout << getTokenTypeName(tokens[i].type) << ": " << tokens[i].value << "\n";
+    // }
 
-    std::cout << "\n FUll token list from naive tokenizer:\n";
-    auto tokens_naive = tokenizeGraphQLNaive(gql_query, strlen(gql_query));
+    // std::cout << "\n FUll token list from naive tokenizer:\n";
+    // auto tokens_naive = tokenizeGraphQLNaive(gql_query, strlen(gql_query));
     
-    for (size_t i = 0; i < tokens_naive.size(); i++) {
-        std::cout << getTokenTypeName(tokens_naive[i].type) << ": " << &tokens_naive[i].value << "\n";
-    }
+    // for (size_t i = 0; i < tokens_naive.size(); i++) {
+    //     std::cout << getTokenTypeName(tokens_naive[i].type) << ": " << &tokens_naive[i].value << "\n";
+    // }
     
     return 0;
 }
