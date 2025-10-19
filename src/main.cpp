@@ -9,6 +9,7 @@
 #include "lexer/token/token_arena.h"
 #include "lexer/token/token.h"
 #include "parser/parser.h"
+#include "ast/ast_arena.h"
 
 // Helper function to convert TokenType to string for display
 const char* tokenTypeToString(TokenType type) {
@@ -88,7 +89,7 @@ void printField(const Field& field, int indent) {
                 std::cout << std::get<IntValue>(field.arguments[i]->value).value;
             } else if (std::holds_alternative<StringValue>(field.arguments[i]->value)) {
                 std::cout << "\"" << std::get<StringValue>(field.arguments[i]->value).value << "\"";
-            } else if (auto* var = std::get_if<std::unique_ptr<Variable>>(&field.arguments[i]->value)) {
+            } else if (auto* var = std::get_if<arena_ptr<Variable>>(&field.arguments[i]->value)) {
                 std::cout << "$" << (*var)->name;
             } else {
                 std::cout << "...";
@@ -115,12 +116,12 @@ void printField(const Field& field, int indent) {
 
 void printSelectionSet(const SelectionSet& sel_set, int indent) {
     for (const auto& selection : sel_set.selections) {
-        if (auto* field_ptr = std::get_if<std::unique_ptr<Field>>(&selection)) {
+        if (auto* field_ptr = std::get_if<arena_ptr<Field>>(&selection)) {
             printField(**field_ptr, indent);
-        } else if (auto* spread_ptr = std::get_if<std::unique_ptr<FragmentSpread>>(&selection)) {
+        } else if (auto* spread_ptr = std::get_if<arena_ptr<FragmentSpread>>(&selection)) {
             std::string ind(indent * 2, ' ');
             std::cout << ind << "..." << (*spread_ptr)->name << "\n";
-        } else if (auto* inline_ptr = std::get_if<std::unique_ptr<InlineFragment>>(&selection)) {
+        } else if (auto* inline_ptr = std::get_if<arena_ptr<InlineFragment>>(&selection)) {
             std::string ind(indent * 2, ' ');
             std::cout << ind << "... on " << (*inline_ptr)->type_condition << "\n";
             if ((*inline_ptr)->selection_set) {
@@ -137,8 +138,8 @@ void printAST(const Document& doc, int indent = 0) {
     for (size_t i = 0; i < doc.definitions.size(); i++) {
         const auto& def = doc.definitions[i];
         
-        if (std::holds_alternative<std::unique_ptr<OperationDefinition>>(def)) {
-            const auto& op = std::get<std::unique_ptr<OperationDefinition>>(def);
+        if (std::holds_alternative<arena_ptr<OperationDefinition>>(def)) {
+            const auto& op = std::get<arena_ptr<OperationDefinition>>(def);
             std::cout << ind << "[" << i << "] ";
             
             switch (op->operation_type) {
@@ -179,8 +180,8 @@ void printAST(const Document& doc, int indent = 0) {
             
             std::cout << ind << "}\n\n";
             
-        } else if (std::holds_alternative<std::unique_ptr<FragmentDefinition>>(def)) {
-            const auto& frag = std::get<std::unique_ptr<FragmentDefinition>>(def);
+        } else if (std::holds_alternative<arena_ptr<FragmentDefinition>>(def)) {
+            const auto& frag = std::get<arena_ptr<FragmentDefinition>>(def);
             std::cout << ind << "[" << i << "] FRAGMENT " << frag->name 
                      << " on " << frag->type_condition << " {\n";
                      
@@ -272,7 +273,8 @@ query GetUser($userId: ID!) {
     
     // Convert pmr::vector to std::vector for parser
     std::vector<Token> token_vec(tokens.begin(), tokens.end());
-    Parser parser(token_vec);
+    ASTArena ast_arena;  // Create arena for AST nodes
+    Parser parser(token_vec, ast_arena);
     
     auto start_parse = std::chrono::high_resolution_clock::now();
     auto ast = parser.parse_document();

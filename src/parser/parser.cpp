@@ -1,8 +1,8 @@
 #include "parser/parser.h"
 #include <sstream>
 
-Parser::Parser(const std::vector<Token>& tokens)
-    : tokens_(tokens), current_(0) {}
+Parser::Parser(const std::vector<Token>& tokens, ASTArena& arena)
+    : tokens_(tokens), current_(0), arena_(arena) {}
 
 // Token navigation
 const Token& Parser::current_token() const {
@@ -113,7 +113,7 @@ bool Parser::is_name_token() const {
 }
 
 // Main parsing
-std::unique_ptr<Document> Parser::parse_document() {
+arena_ptr<Document> Parser::parse_document() {
     try {
         return parse_document_impl();
     } catch (const std::exception& e) {
@@ -122,8 +122,8 @@ std::unique_ptr<Document> Parser::parse_document() {
     }
 }
 
-std::unique_ptr<Document> Parser::parse_document_impl() {
-    auto doc = std::make_unique<Document>();
+arena_ptr<Document> Parser::parse_document_impl() {
+    auto* doc = arena_.create<Document>();
     
     while (!is_at_end()) {
         try {
@@ -134,7 +134,7 @@ std::unique_ptr<Document> Parser::parse_document_impl() {
         }
     }
     
-    return doc;
+    return arena_ptr<Document>(doc);
 }
 
 Definition Parser::parse_definition() {
@@ -156,8 +156,8 @@ OperationType Parser::parse_operation_type() {
     return OperationType::QUERY;
 }
 
-std::unique_ptr<OperationDefinition> Parser::parse_operation_definition() {
-    auto op = std::make_unique<OperationDefinition>();
+arena_ptr<OperationDefinition> Parser::parse_operation_definition() {
+    auto* op = arena_.create<OperationDefinition>();
     op->position = current_token().position;
     
     // Check for shorthand query (just selection set)
@@ -165,7 +165,7 @@ std::unique_ptr<OperationDefinition> Parser::parse_operation_definition() {
         op->operation_type = OperationType::QUERY;
         op->name = "";
         op->selection_set = parse_selection_set();
-        return op;
+        return arena_ptr<OperationDefinition>(op);
     }
     
     // Parse operation type
@@ -188,15 +188,15 @@ std::unique_ptr<OperationDefinition> Parser::parse_operation_definition() {
     // Selection set (required)
     if (!check(TokenType::LEFT_BRACE)) {
         error("Expected selection set");
-        return op;
+        return arena_ptr<OperationDefinition>(op);
     }
     op->selection_set = parse_selection_set();
     
-    return op;
+    return arena_ptr<OperationDefinition>(op);
 }
 
-std::unique_ptr<FragmentDefinition> Parser::parse_fragment_definition() {
-    auto frag = std::make_unique<FragmentDefinition>();
+arena_ptr<FragmentDefinition> Parser::parse_fragment_definition() {
+    auto* frag = arena_.create<FragmentDefinition>();
     frag->position = current_token().position;
     
     expect(TokenType::KEYWORD_FRAGMENT, "Expected 'fragment'");
@@ -204,7 +204,7 @@ std::unique_ptr<FragmentDefinition> Parser::parse_fragment_definition() {
     // Fragment name
     if (!check(TokenType::IDENTIFIER)) {
         error("Expected fragment name");
-        return frag;
+        return arena_ptr<FragmentDefinition>(frag);
     }
     frag->name = current_value();
     advance();
@@ -214,7 +214,7 @@ std::unique_ptr<FragmentDefinition> Parser::parse_fragment_definition() {
     
     if (!check(TokenType::IDENTIFIER)) {
         error("Expected type name");
-        return frag;
+        return arena_ptr<FragmentDefinition>(frag);
     }
     frag->type_condition = current_value();
     advance();
@@ -225,11 +225,11 @@ std::unique_ptr<FragmentDefinition> Parser::parse_fragment_definition() {
     // Selection set
     frag->selection_set = parse_selection_set();
     
-    return frag;
+    return arena_ptr<FragmentDefinition>(frag);
 }
 
-std::unique_ptr<SelectionSet> Parser::parse_selection_set() {
-    auto sel_set = std::make_unique<SelectionSet>();
+arena_ptr<SelectionSet> Parser::parse_selection_set() {
+    auto* sel_set = arena_.create<SelectionSet>();
     sel_set->position = current_token().position;
     
     expect(TokenType::LEFT_BRACE, "Expected '{'");
@@ -250,7 +250,7 @@ std::unique_ptr<SelectionSet> Parser::parse_selection_set() {
     
     expect(TokenType::RIGHT_BRACE, "Expected '}'");
     
-    return sel_set;
+    return arena_ptr<SelectionSet>(sel_set);
 }
 
 Selection Parser::parse_selection() {
@@ -271,13 +271,13 @@ Selection Parser::parse_selection() {
     return parse_field();
 }
 
-std::unique_ptr<Field> Parser::parse_field() {
-    auto field = std::make_unique<Field>();
+arena_ptr<Field> Parser::parse_field() {
+    auto* field = arena_.create<Field>();
     field->position = current_token().position;
     
     if (!check(TokenType::IDENTIFIER)) {
         error("Expected field name");
-        return field;
+        return arena_ptr<Field>(field);
     }
     
     // Check for alias (fieldName: actualField)
@@ -289,7 +289,7 @@ std::unique_ptr<Field> Parser::parse_field() {
         field->alias = first_name;
         if (!check(TokenType::IDENTIFIER)) {
             error("Expected field name after ':'");
-            return field;
+            return arena_ptr<Field>(field);
         }
         field->name = current_value();
         advance();
@@ -311,16 +311,16 @@ std::unique_ptr<Field> Parser::parse_field() {
         field->selection_set = parse_selection_set();
     }
     
-    return field;
+    return arena_ptr<Field>(field);
 }
 
-std::unique_ptr<FragmentSpread> Parser::parse_fragment_spread() {
-    auto spread = std::make_unique<FragmentSpread>();
+arena_ptr<FragmentSpread> Parser::parse_fragment_spread() {
+    auto* spread = arena_.create<FragmentSpread>();
     spread->position = current_token().position;
     
     if (!check(TokenType::IDENTIFIER)) {
         error("Expected fragment name");
-        return spread;
+        return arena_ptr<FragmentSpread>(spread);
     }
     
     spread->name = current_value();
@@ -328,11 +328,11 @@ std::unique_ptr<FragmentSpread> Parser::parse_fragment_spread() {
     
     spread->directives = parse_directives();
     
-    return spread;
+    return arena_ptr<FragmentSpread>(spread);
 }
 
-std::unique_ptr<InlineFragment> Parser::parse_inline_fragment() {
-    auto frag = std::make_unique<InlineFragment>();
+arena_ptr<InlineFragment> Parser::parse_inline_fragment() {
+    auto* frag = arena_.create<InlineFragment>();
     frag->position = current_token().position;
     
     // 'on' keyword already consumed
@@ -347,12 +347,12 @@ std::unique_ptr<InlineFragment> Parser::parse_inline_fragment() {
     frag->directives = parse_directives();
     frag->selection_set = parse_selection_set();
     
-    return frag;
+    return arena_ptr<InlineFragment>(frag);
 }
 
 // Arguments
-std::vector<std::unique_ptr<Argument>> Parser::parse_arguments() {
-    std::vector<std::unique_ptr<Argument>> args;
+std::vector<arena_ptr<Argument>> Parser::parse_arguments() {
+    std::vector<arena_ptr<Argument>> args;
     
     expect(TokenType::LEFT_PAREN, "Expected '('");
     
@@ -375,14 +375,14 @@ std::vector<std::unique_ptr<Argument>> Parser::parse_arguments() {
     return args;
 }
 
-std::unique_ptr<Argument> Parser::parse_argument() {
-    auto arg = std::make_unique<Argument>();
+arena_ptr<Argument> Parser::parse_argument() {
+    auto* arg = arena_.create<Argument>();
     arg->position = current_token().position;
     
     // Argument names can be identifiers or keywords (GraphQL allows keywords as names)
     if (!is_name_token()) {
         error("Expected argument name");
-        return arg;
+        return arena_ptr<Argument>(arg);
     }
     
     arg->name = current_value();
@@ -392,12 +392,12 @@ std::unique_ptr<Argument> Parser::parse_argument() {
     
     arg->value = parse_value();
     
-    return arg;
+    return arena_ptr<Argument>(arg);
 }
 
 // Directives
-std::vector<std::unique_ptr<Directive>> Parser::parse_directives() {
-    std::vector<std::unique_ptr<Directive>> directives;
+std::vector<arena_ptr<Directive>> Parser::parse_directives() {
+    std::vector<arena_ptr<Directive>> directives;
     
     while (check(TokenType::DIRECTIVE)) {
         directives.push_back(parse_directive());
@@ -406,8 +406,8 @@ std::vector<std::unique_ptr<Directive>> Parser::parse_directives() {
     return directives;
 }
 
-std::unique_ptr<Directive> Parser::parse_directive() {
-    auto dir = std::make_unique<Directive>();
+arena_ptr<Directive> Parser::parse_directive() {
+    auto* dir = arena_.create<Directive>();
     dir->position = current_token().position;
     
     // Directive name (without @)
@@ -424,12 +424,12 @@ std::unique_ptr<Directive> Parser::parse_directive() {
         dir->arguments = parse_arguments();
     }
     
-    return dir;
+    return arena_ptr<Directive>(dir);
 }
 
 // Variables
-std::vector<std::unique_ptr<VariableDefinition>> Parser::parse_variable_definitions() {
-    std::vector<std::unique_ptr<VariableDefinition>> var_defs;
+std::vector<arena_ptr<VariableDefinition>> Parser::parse_variable_definitions() {
+    std::vector<arena_ptr<VariableDefinition>> var_defs;
     
     expect(TokenType::LEFT_PAREN, "Expected '('");
     
@@ -452,8 +452,8 @@ std::vector<std::unique_ptr<VariableDefinition>> Parser::parse_variable_definiti
     return var_defs;
 }
 
-std::unique_ptr<VariableDefinition> Parser::parse_variable_definition() {
-    auto var_def = std::make_unique<VariableDefinition>();
+arena_ptr<VariableDefinition> Parser::parse_variable_definition() {
+    auto* var_def = arena_.create<VariableDefinition>();
     var_def->position = current_token().position;
     
     // Variable
@@ -466,22 +466,22 @@ std::unique_ptr<VariableDefinition> Parser::parse_variable_definition() {
     
     // Default value
     if (match(TokenType::SYMBOL) && tokens_[current_ - 1].value == "=") {
-        var_def->default_value = std::make_unique<Value>(parse_value());
+        auto* default_val = arena_.create<Value>(parse_value()); var_def->default_value = arena_ptr<Value>(default_val);
     }
     
     // Directives
     var_def->directives = parse_directives();
     
-    return var_def;
+    return arena_ptr<VariableDefinition>(var_def);
 }
 
-std::unique_ptr<Variable> Parser::parse_variable() {
-    auto var = std::make_unique<Variable>();
+arena_ptr<Variable> Parser::parse_variable() {
+    auto* var = arena_.create<Variable>();
     var->position = current_token().position;
     
     if (!check(TokenType::VARIABLE)) {
         error("Expected variable");
-        return var;
+        return arena_ptr<Variable>(var);
     }
     
     // Variable name (without $)
@@ -493,12 +493,12 @@ std::unique_ptr<Variable> Parser::parse_variable() {
     }
     advance();
     
-    return var;
+    return arena_ptr<Variable>(var);
 }
 
 // Types
-std::unique_ptr<ASTNode> Parser::parse_type() {
-    std::unique_ptr<ASTNode> type;
+arena_ptr<ASTNode> Parser::parse_type() {
+    arena_ptr<ASTNode> type;
     
     if (check(TokenType::LEFT_BRACKET)) {
         type = parse_list_type();
@@ -511,13 +511,14 @@ std::unique_ptr<ASTNode> Parser::parse_type() {
         NonNullType nnt;
         nnt.type = std::move(type);
         nnt.position = current_token().position;
-        return std::make_unique<ASTNode>(std::move(nnt));
+        auto* node = arena_.create<ASTNode>(std::move(nnt));
+        return arena_ptr<ASTNode>(node);
     }
     
     return type;
 }
 
-std::unique_ptr<ASTNode> Parser::parse_named_type() {
+arena_ptr<ASTNode> Parser::parse_named_type() {
     NamedType nt;
     nt.position = current_token().position;
     
@@ -528,10 +529,11 @@ std::unique_ptr<ASTNode> Parser::parse_named_type() {
         advance();
     }
     
-    return std::make_unique<ASTNode>(std::move(nt));
+    auto* node = arena_.create<ASTNode>(std::move(nt));
+    return arena_ptr<ASTNode>(node);
 }
 
-std::unique_ptr<ASTNode> Parser::parse_list_type() {
+arena_ptr<ASTNode> Parser::parse_list_type() {
     ListType lt;
     lt.position = current_token().position;
     
@@ -539,14 +541,16 @@ std::unique_ptr<ASTNode> Parser::parse_list_type() {
     lt.type = parse_type();
     expect(TokenType::RIGHT_BRACKET, "Expected ']'");
     
-    return std::make_unique<ASTNode>(std::move(lt));
+    auto* node = arena_.create<ASTNode>(std::move(lt));
+    return arena_ptr<ASTNode>(node);
 }
 
 // Values
 Value Parser::parse_value() {
     if (check(TokenType::VARIABLE)) {
         auto var = parse_variable();
-        return std::make_unique<Variable>(std::move(*var));
+        // Transfer ownership - var is already arena_ptr, just move it
+        return std::move(var);
     }
     
     if (check(TokenType::NUMBER)) {
@@ -637,7 +641,7 @@ Value Parser::parse_enum_value() {
 }
 
 Value Parser::parse_list_value() {
-    auto lv = std::make_unique<ListValue>();
+    auto* lv = arena_.create<ListValue>();
     lv->position = current_token().position;
     
     expect(TokenType::LEFT_BRACKET, "Expected '['");
@@ -658,11 +662,11 @@ Value Parser::parse_list_value() {
     
     expect(TokenType::RIGHT_BRACKET, "Expected ']'");
     
-    return std::make_unique<ListValue>(std::move(*lv));
+    return arena_ptr<ListValue>(lv);
 }
 
 Value Parser::parse_object_value() {
-    auto ov = std::make_unique<ObjectValue>();
+    auto* ov = arena_.create<ObjectValue>();
     ov->position = current_token().position;
     
     expect(TokenType::LEFT_BRACE, "Expected '{'");
@@ -700,6 +704,6 @@ Value Parser::parse_object_value() {
     
     expect(TokenType::RIGHT_BRACE, "Expected '}'");
     
-    return std::make_unique<ObjectValue>(std::move(*ov));
+    return arena_ptr<ObjectValue>(ov);
 }
 
