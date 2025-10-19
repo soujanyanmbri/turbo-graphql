@@ -54,6 +54,9 @@ target_link_libraries(graphql_benchmark PRIVATE graphql_core)
 add_executable(benchmark benchmark_simd_simple.cpp)
 target_link_libraries(benchmark PRIVATE graphql_core)
 
+add_executable(benchmark_comparison benchmark_comparison.cpp)
+target_link_libraries(benchmark_comparison PRIVATE graphql_core)
+
 enable_testing()
 
 include(FetchContent)

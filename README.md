@@ -10,7 +10,7 @@ A **high-performance GraphQL parser** written in C++ with SIMD-accelerated lexin
 - **Zero-Copy Design**: Efficient memory management with token arenas
 - **Auto-Detection**: Automatic CPU feature detection (AVX512, AVX2, SSE4.2, SSE2, NEON, Scalar)
 
-### 📝 Complete GraphQL Support
+### Complete GraphQL Support
 - ✅ **Operations**: Query, Mutation, Subscription
 - ✅ **Variables**: Type definitions with non-null modifiers (`$userId: ID!`)
 - ✅ **Arguments**: Named arguments with all value types
