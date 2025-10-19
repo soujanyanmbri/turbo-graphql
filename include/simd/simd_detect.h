@@ -1,5 +1,4 @@
-#ifndef SIMD_DETECTOR_H
-#define SIMD_DETECTOR_H
+#pragma once
 
 #include <cstdint>
 
@@ -7,6 +6,7 @@ enum class SIMDType {
     AVX512,
     AVX2,
     SSE4_2,
+    SSE2,
     NEON,  // For ARM
     SCALAR,
     UNKNOWN
@@ -15,6 +15,5 @@ enum class SIMDType {
 class SIMDDetector {
 public:
     static SIMDType detectBestSIMD();
+    static void printBestSIMD();
 };
-
-#endif // SIMD_DETECTOR_H

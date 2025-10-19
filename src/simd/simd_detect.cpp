@@ -1,4 +1,4 @@
-#include "utils/SimdDetector.h"
+#include "simd/simd_detect.h"
 #include <cstdint>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -34,3 +34,28 @@ SIMDType SIMDDetector::detectBestSIMD() {
 
     return SIMDType::SCALAR;
 }
+
+#include <iostream>
+
+void SIMDDetector::printBestSIMD() {
+    SIMDType type = detectBestSIMD();
+
+    switch (type) {
+        case SIMDType::UNKNOWN:
+            std::cout << "UNKNOWN" << std::endl;
+            break;
+        case SIMDType::SSE4_2:
+            std::cout << "SSE4.2" << std::endl;
+            break;
+        case SIMDType::AVX2:
+            std::cout << "AVX2" << std::endl;
+            break;
+        case SIMDType::NEON:
+            std::cout << "NEON" << std::endl;
+            break;
+        default:
+            std::cout << "Unknown" << std::endl;
+            break;
+    }
+}
+

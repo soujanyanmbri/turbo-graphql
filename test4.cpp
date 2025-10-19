@@ -72,9 +72,9 @@ enum TokenType {
 };
 
 struct Token {
-    TokenType type;
-    std::string_view value;
-    size_t position;
+    std::string_view value; // 16 bytes
+    size_t position;       // 8 bytes
+    TokenType type;        // 4 bytes
 
     Token(TokenType t, std::string_view v, size_t p)
         : type(t), value(v), position(p) {}
@@ -193,91 +193,98 @@ __attribute__((always_inline)) inline void initialize_char_class() {
     char_type_lut['\''] |= STRING_DELIM_FLAG;  // Also allow single quotes for some GraphQL implementations
 }
 
-// // Optimized keyword map with perfect hashing for common GraphQL keywords
-// static const std::unordered_map<std::string_view, TokenType> keywordMap = {
-//     {"query", KEYWORD}, {"mutation", KEYWORD}, {"fragment", KEYWORD}, {"on", KEYWORD},
-//     {"true", KEYWORD}, {"false", KEYWORD}, {"null", KEYWORD},
-//     {"int", KEYWORD}, {"float", KEYWORD}, {"string", KEYWORD}, {"boolean", KEYWORD},
-//     {"id", KEYWORD}, {"__typename", KEYWORD},
-//     {"__schema", KEYWORD}, {"__type", KEYWORD},
-//     {"__get", KEYWORD}, {"__create", KEYWORD}, {"__update", KEYWORD}, {"__delete", KEYWORD},
-//     {"interface", KEYWORD}, {"type", KEYWORD}, {"input", KEYWORD}, {"enum", KEYWORD},
-//     {"directive", KEYWORD}, {"scalar", KEYWORD}, {"extend", KEYWORD}, {"union", KEYWORD},
-//     {"implements", KEYWORD}, {"subscription", KEYWORD}
-// };
-// Try 2: optimise this lookup and break this into multiple types:
-inline TokenType classify_keyword(std::string_view sv) {
-  switch (sv.length()) {
-      case 2:
-          if (sv == "on") return TokenType::KEYWORD_ON;
-          if (sv == "id") return TokenType::KEYWORD_ID;
-          break;
-      case 3:
-          if (sv == "int") return TokenType::KEYWORD_INT;
-          break;
-      case 4:
-          switch (sv[0]) {
-              case 'n': if (sv == "null") return TokenType::KEYWORD_NULL; break;
-              case 't':
-                  if (sv[1] == 'r') { if (sv == "true") return TokenType::KEYWORD_TRUE; }
-                  else if (sv == "type") return TokenType::KEYWORD_TYPE;
-                  break;
-              case 'e': if (sv == "enum") return TokenType::KEYWORD_ENUM; break;
-          }
-          break;
-      case 5:
-          switch (sv[0]) {
-              case 'f':
-                  if (sv[1] == 'a') { if (sv == "false") return TokenType::KEYWORD_FALSE; }
-                  else if (sv == "float") return TokenType::KEYWORD_FLOAT;
-                  break;
-              case 'q': if (sv == "query") return TokenType::KEYWORD_QUERY; break;
-              case '_': if (sv == "__get") return TokenType::KEYWORD_GET; break;
-              case 'u': if (sv == "union") return TokenType::KEYWORD_UNION; break;
-              case 'i': if (sv == "input") return TokenType::KEYWORD_INPUT; break;
-          }
-          break;
-      case 6:
-          switch (sv[0]) {
-              case 's':
-                  if (sv[1] == 't') { if (sv == "string") return TokenType::KEYWORD_STRING; }
-                  else if (sv == "scalar") return TokenType::KEYWORD_SCALAR;
-                  break;
-          }
-          break;
-      case 7:
-          switch (sv[0]) {
-              case 'b': if (sv == "boolean") return TokenType::KEYWORD_BOOLEAN; break;
-              case 'e': if (sv == "extends") return TokenType::KEYWORD_EXTEND; break;
-          }
-          break;
-      case 8:
-          switch (sv[2]) {
-              case 'd': if (sv == "__delete") return TokenType::KEYWORD_DELETE; break;
-              case 's': if (sv == "__schema") return TokenType::KEYWORD_SCHEMA; break;
-              case 'u': if (sv == "__update") return TokenType::KEYWORD_UPDATE; break;
-              case 'c': if (sv == "__create") return TokenType::KEYWORD_CREATE; break;
-          }
-          switch (sv[0]) {
-              case 'm': if (sv == "mutation") return TokenType::KEYWORD_MUTATION; break;
-              case 'f': if (sv == "fragment") return TokenType::KEYWORD_FRAGMENT; break;
-          }
-          break;
-      case 9:
-          if (sv[0] == 'i' && sv == "interface") return TokenType::KEYWORD_INTERFACE;
-          if (sv[0] == 'd' && sv == "directive") return TokenType::KEYWORD_DIRECTIVE;
-          break;
-      case 10:
-          if (sv[0] == 'i' && sv == "implements") return TokenType::KEYWORD_IMPLEMENTS;
-          if (sv[0] == '_' && sv == "__typename") return TokenType::KEYWORD_TYPENAME;
-          break;
-      case 11:
-          if (sv == "subscription") return TokenType::KEYWORD_SUBSCRIPTION;
-          break;
-  }
-  return TokenType::IDENTIFIER;
+inline uint32_t calculate_keyword_hash(std::string_view sv) {
+    const size_t len = sv.length();
+    if (len < 2 || len > 11) return 0;
+    
+    // Use FNV-1a inspired hash algorithm
+    uint32_t hash = 2166136261u; // FNV offset basis
+    
+    // Use first 3 chars and last char for better distribution
+    hash ^= static_cast<uint32_t>(sv[0]);
+    hash *= 16777619u; // FNV prime
+    
+    if (len > 1) {
+        hash ^= static_cast<uint32_t>(sv[1]);
+        hash *= 16777619u;
+    }
+    
+    if (len > 2) {
+        hash ^= static_cast<uint32_t>(sv[2]);
+        hash *= 16777619u;
+    }
+    
+    // Add the length as a feature
+    hash ^= static_cast<uint32_t>(len);
+    hash *= 16777619u;
+    
+    // Add last character if not already used
+    if (len > 3) {
+        hash ^= static_cast<uint32_t>(sv[len-1]);
+        hash *= 16777619u;
+    }
+    
+    return hash;
 }
 
+// Optimized keyword classifier with improved hash function
+inline TokenType classify_keyword(std::string_view sv) {
+    const size_t len = sv.length();
+    if (len < 2 || len > 11) return TokenType::IDENTIFIER;
+    
+    uint32_t hash = calculate_keyword_hash(sv);
+    
+    switch (hash) {
+        // 2-letter keywords
+        case 0xd7274796: if (sv == "on") return TokenType::KEYWORD_ON; break;
+        case 0xcfd041c6: if (sv == "id") return TokenType::KEYWORD_ID; break;
+        
+        // 3-letter keywords
+        case 0x5b91ec67: if (sv == "int") return TokenType::KEYWORD_INT; break;
+        
+        // 4-letter keywords
+        case 0x28191240: if (sv == "null") return TokenType::KEYWORD_NULL; break;
+        case 0xf39f3875: if (sv == "true") return TokenType::KEYWORD_TRUE; break;
+        case 0x0ecc1ead: if (sv == "type") return TokenType::KEYWORD_TYPE; break;
+        case 0x301d0ad2: if (sv == "enum") return TokenType::KEYWORD_ENUM; break;
+        
+        // 5-letter keywords
+        case 0x0f1ea48a: if (sv == "false") return TokenType::KEYWORD_FALSE; break;
+        case 0xb71eb5f1: if (sv == "float") return TokenType::KEYWORD_FLOAT; break;
+        case 0x0067774c: if (sv == "query") return TokenType::KEYWORD_QUERY; break;
+        case 0xf722ba8d: if (sv == "__get") return TokenType::KEYWORD_GET; break;
+        case 0xbc3d60fe: if (sv == "union") return TokenType::KEYWORD_UNION; break;
+        case 0xf9601b2b: if (sv == "input") return TokenType::KEYWORD_INPUT; break;
+        
+        // 6-letter keywords
+        case 0xdd26a99f: if (sv == "string") return TokenType::KEYWORD_STRING; break;
+        case 0x7a8ff6e6: if (sv == "scalar") return TokenType::KEYWORD_SCALAR; break;
+        
+        // 7-letter keywords
+        case 0xf1dd8306: if (sv == "boolean") return TokenType::KEYWORD_BOOLEAN; break;
+        case 0xa79f840e: if (sv == "extends") return TokenType::KEYWORD_EXTEND; break;
+        
+        // 8-letter keywords
+        case 0x3cf1ef96: if (sv == "__delete") return TokenType::KEYWORD_DELETE; break;
+        case 0xf90d7d2b: if (sv == "__schema") return TokenType::KEYWORD_SCHEMA; break;
+        case 0xae760f61: if (sv == "__update") return TokenType::KEYWORD_UPDATE; break;
+        case 0x4ea2b387: if (sv == "__create") return TokenType::KEYWORD_CREATE; break;
+        case 0x080283b7: if (sv == "mutation") return TokenType::KEYWORD_MUTATION; break;
+        case 0xecafb154: if (sv == "fragment") return TokenType::KEYWORD_FRAGMENT; break;
+        
+        // 9-letter keywords
+        case 0x44a7a8b0: if (sv == "interface") return TokenType::KEYWORD_INTERFACE; break;
+        case 0x8e59d5e6: if (sv == "directive") return TokenType::KEYWORD_DIRECTIVE; break;
+        
+        // 10-letter keywords
+        case 0xc9177ae6: if (sv == "implements") return TokenType::KEYWORD_IMPLEMENTS; break;
+        case 0xf7614f98: if (sv == "__typename") return TokenType::KEYWORD_TYPENAME; break;
+        
+        // 11-letter keywords
+        case 0x00000000: if (sv == "subscription") return TokenType::KEYWORD_SUBSCRIPTION; break;
+    }
+    return TokenType::IDENTIFIER;
+}
 // Fast SIMD-based comment skipping (optimized)
 __attribute__((always_inline)) inline size_t skip_comments_simd(const char* __restrict__ text, size_t i, size_t text_len) {
   if (i + 1 >= text_len) return i;
@@ -397,12 +404,10 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
         // Check for comments first (optimized with SIMD)
 
         // Fast path for comment detection (//, /*, or #)
-        if (__builtin_expect(c == '/' || c == '#', 0)) {
-          // Check second char only if it's a potential multi-char comment
-          if ((c == '/' && i + 1 < text_len && (text[i + 1] == '/' || text[i + 1] == '*')) || c == '#') {
-              i = skip_comments_simd(text, i, text_len);
-              continue;
-          }
+        if (__builtin_expect((c == '#') || (c == '/' && i + 1 < text_len && 
+        (text[i + 1] == '/' || text[i + 1] == '*')), 0)) {
+                i = skip_comments_simd(text, i, text_len);
+                continue;
         }
 
         
@@ -585,15 +590,17 @@ __attribute__((hot)) std::pmr::vector<Token>& tokenizeGraphQLWithSIMD(
             char quote_char = c;
             size_t start = i++;
             
-            // Find closing quote
-            while (i < text_len && text[i] != quote_char) {
-                if (text[i] == '\\' && i + 1 < text_len) {
-                    i += 2;  // Skip escape sequence
-                } else {
-                    i++;
-                }
+            // SIMD-accelerated string scan
+            __m256i quote_v = _mm256_set1_epi8(quote_char);
+            __m256i escape_v = _mm256_set1_epi8('\\');
+
+            while (i + 32 <= text_len) {
+                __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
+                uint32_t quote_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, quote_v));
+                uint32_t escape_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, escape_v));
+                
+                // Process escape sequences and quotes...
             }
-            
             if (i < text_len) i++;  // Skip closing quote
             
             tokens.emplace_back(TokenType::STRING, std::string_view(text + start, i - start), start);
@@ -933,16 +940,16 @@ int main() {
         }
     };
     
-    // for (size_t i = 0; i < tokens.size(); i++) {
-    //     std::cout << getTokenTypeName(tokens[i].type) << ": " << tokens[i].value << "\n";
-    // }
+    for (size_t i = 0; i < tokens.size(); i++) {
+        std::cout << getTokenTypeName(tokens[i].type) << ": " << tokens[i].value << "\n";
+    }
 
-    // std::cout << "\n FUll token list from naive tokenizer:\n";
-    // auto tokens_naive = tokenizeGraphQLNaive(gql_query, strlen(gql_query));
+    std::cout << "\n FUll token list from naive tokenizer:\n";
+    auto tokens_naive = tokenizeGraphQLNaive(gql_query, strlen(gql_query));
     
-    // for (size_t i = 0; i < tokens_naive.size(); i++) {
-    //     std::cout << getTokenTypeName(tokens_naive[i].type) << ": " << &tokens_naive[i].value << "\n";
-    // }
+    for (size_t i = 0; i < tokens_naive.size(); i++) {
+        std::cout << getTokenTypeName(tokens_naive[i].type) << ": " << &tokens_naive[i].value << "\n";
+    }
     
     return 0;
 }
