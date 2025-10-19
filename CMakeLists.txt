@@ -20,6 +20,12 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 file(GLOB_RECURSE SOURCES "src/*.cpp")
 list(REMOVE_ITEM SOURCES "${CMAKE_SOURCE_DIR}/src/main.cpp")
+
+# Add parser sources explicitly
+set(PARSER_SOURCES
+    src/parser/parser.cpp
+)
+
 add_library(graphql_core ${SOURCES})
 
 # Apply SIMD flags only to SIMD implementation files

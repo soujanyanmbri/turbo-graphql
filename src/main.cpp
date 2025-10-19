@@ -8,6 +8,7 @@
 #include "lexer/lexer.h"
 #include "lexer/token/token_arena.h"
 #include "lexer/token/token.h"
+#include "parser/parser.h"
 
 // Helper function to convert TokenType to string for display
 const char* tokenTypeToString(TokenType type) {
@@ -64,44 +65,132 @@ const char* tokenTypeToString(TokenType type) {
     }
 }
 
-void printTokens(const std::pmr::vector<Token>& tokens, int max_tokens = 50) {
-    std::cout << "\n+-----+---------------------+----------------------+-----------------+\n";
-    std::cout << "| No. | Type                | Value                | Position        |\n";
-    std::cout << "+-----+---------------------+----------------------+-----------------+\n";
+// Forward declarations for recursive printing
+void printSelectionSet(const SelectionSet& sel_set, int indent);
+void printValue(const Value& value, int indent);
+
+void printField(const Field& field, int indent) {
+    std::string ind(indent * 2, ' ');
+    std::cout << ind << "Field: ";
     
-    size_t limit = std::min(tokens.size(), (size_t)max_tokens);
-    for (size_t i = 0; i < limit; i++) {
-        const auto& token = tokens[i];
-        std::string value(token.value);
-        
-        // Truncate long values
-        if (value.length() > 20) {
-            value = value.substr(0, 17) + "...";
+    if (!field.alias.empty()) {
+        std::cout << field.alias << ": ";
+    }
+    std::cout << field.name;
+    
+    if (!field.arguments.empty()) {
+        std::cout << "(";
+        for (size_t i = 0; i < field.arguments.size(); i++) {
+            if (i > 0) std::cout << ", ";
+            std::cout << field.arguments[i]->name << ": ";
+            // Print a simplified value representation
+            if (std::holds_alternative<IntValue>(field.arguments[i]->value)) {
+                std::cout << std::get<IntValue>(field.arguments[i]->value).value;
+            } else if (std::holds_alternative<StringValue>(field.arguments[i]->value)) {
+                std::cout << "\"" << std::get<StringValue>(field.arguments[i]->value).value << "\"";
+            } else if (auto* var = std::get_if<std::unique_ptr<Variable>>(&field.arguments[i]->value)) {
+                std::cout << "$" << (*var)->name;
+            } else {
+                std::cout << "...";
+            }
         }
-        
-        // Escape newlines and tabs for display
-        size_t pos = 0;
-        while ((pos = value.find('\n', pos)) != std::string::npos) {
-            value.replace(pos, 1, "\\n");
-            pos += 2;
-        }
-        pos = 0;
-        while ((pos = value.find('\t', pos)) != std::string::npos) {
-            value.replace(pos, 1, "\\t");
-            pos += 2;
-        }
-        
-        std::cout << "| " << std::setw(3) << (i + 1) << " | "
-                  << std::left << std::setw(19) << tokenTypeToString(token.type) << " | "
-                  << std::setw(20) << value << " | "
-                  << std::setw(15) << token.position << " |\n";
+        std::cout << ")";
     }
     
-    std::cout << "+-----+---------------------+----------------------+-----------------+\n";
-    if (tokens.size() > max_tokens) {
-        std::cout << "... and " << (tokens.size() - max_tokens) << " more tokens\n";
+    if (!field.directives.empty()) {
+        for (const auto& dir : field.directives) {
+            std::cout << " @" << dir->name;
+            if (!dir->arguments.empty()) {
+                std::cout << "(...)";
+            }
+        }
     }
-    std::cout << "Total tokens: " << tokens.size() << "\n\n";
+    
+    std::cout << "\n";
+    
+    if (field.selection_set) {
+        printSelectionSet(*field.selection_set, indent + 1);
+    }
+}
+
+void printSelectionSet(const SelectionSet& sel_set, int indent) {
+    for (const auto& selection : sel_set.selections) {
+        if (auto* field_ptr = std::get_if<std::unique_ptr<Field>>(&selection)) {
+            printField(**field_ptr, indent);
+        } else if (auto* spread_ptr = std::get_if<std::unique_ptr<FragmentSpread>>(&selection)) {
+            std::string ind(indent * 2, ' ');
+            std::cout << ind << "..." << (*spread_ptr)->name << "\n";
+        } else if (auto* inline_ptr = std::get_if<std::unique_ptr<InlineFragment>>(&selection)) {
+            std::string ind(indent * 2, ' ');
+            std::cout << ind << "... on " << (*inline_ptr)->type_condition << "\n";
+            if ((*inline_ptr)->selection_set) {
+                printSelectionSet(*(*inline_ptr)->selection_set, indent + 1);
+            }
+        }
+    }
+}
+
+void printAST(const Document& doc, int indent = 0) {
+    std::string ind(indent * 2, ' ');
+    std::cout << ind << "Document with " << doc.definitions.size() << " definition(s)\n\n";
+    
+    for (size_t i = 0; i < doc.definitions.size(); i++) {
+        const auto& def = doc.definitions[i];
+        
+        if (std::holds_alternative<std::unique_ptr<OperationDefinition>>(def)) {
+            const auto& op = std::get<std::unique_ptr<OperationDefinition>>(def);
+            std::cout << ind << "[" << i << "] ";
+            
+            switch (op->operation_type) {
+                case OperationType::QUERY: std::cout << "QUERY"; break;
+                case OperationType::MUTATION: std::cout << "MUTATION"; break;
+                case OperationType::SUBSCRIPTION: std::cout << "SUBSCRIPTION"; break;
+            }
+            
+            if (!op->name.empty()) {
+                std::cout << " " << op->name;
+            }
+            
+            // Print variables
+            if (!op->variable_definitions.empty()) {
+                std::cout << "(";
+                for (size_t j = 0; j < op->variable_definitions.size(); j++) {
+                    if (j > 0) std::cout << ", ";
+                    std::cout << "$" << op->variable_definitions[j]->variable->name << ": ";
+                    // Print type (simplified)
+                    auto& type_node = op->variable_definitions[j]->type;
+                    if (std::holds_alternative<NamedType>(type_node->data)) {
+                        std::cout << std::get<NamedType>(type_node->data).name;
+                    } else if (std::holds_alternative<NonNullType>(type_node->data)) {
+                        auto& nnt = std::get<NonNullType>(type_node->data);
+                        if (std::holds_alternative<NamedType>(nnt.type->data)) {
+                            std::cout << std::get<NamedType>(nnt.type->data).name << "!";
+                        }
+                    }
+                }
+                std::cout << ")";
+            }
+            
+            std::cout << " {\n";
+            
+            if (op->selection_set) {
+                printSelectionSet(*op->selection_set, indent + 1);
+            }
+            
+            std::cout << ind << "}\n\n";
+            
+        } else if (std::holds_alternative<std::unique_ptr<FragmentDefinition>>(def)) {
+            const auto& frag = std::get<std::unique_ptr<FragmentDefinition>>(def);
+            std::cout << ind << "[" << i << "] FRAGMENT " << frag->name 
+                     << " on " << frag->type_condition << " {\n";
+                     
+            if (frag->selection_set) {
+                printSelectionSet(*frag->selection_set, indent + 1);
+            }
+            
+            std::cout << ind << "}\n\n";
+        }
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -117,18 +206,15 @@ int main(int argc, char* argv[]) {
     
     // Sample GraphQL query
     const char* sample_query = R"(
-# Sample GraphQL Query
 query GetUser($userId: ID!) {
-    user(id: $userId) {
-        name
-        email
-        age
-        posts @include(if: true) {
-            title
-            content
-            likes
-        }
+  user(id: $userId) {
+    name
+    email
+    posts @include(if: true) {
+      title
+      content
     }
+  }
 }
 )";
     
@@ -161,39 +247,80 @@ query GetUser($userId: ID!) {
     
     // Display the query
     std::cout << "\n" << std::string(68, '-') << "\n";
-    std::cout << "Query to tokenize:\n";
+    std::cout << "Query to parse:\n";
     std::cout << std::string(68, '-') << "\n";
     std::cout << query_to_parse << "\n";
     std::cout << std::string(68, '-') << "\n";
     
     // Tokenize the query
-    std::cout << "\nTokenizing with SIMD-accelerated lexer...\n";
+    std::cout << "\n[1/2] Tokenizing with SIMD-accelerated lexer...\n";
     
     TokenArena arena;
     Tokenizer tokenizer;
     
-    auto start = std::chrono::high_resolution_clock::now();
+    auto start_lex = std::chrono::high_resolution_clock::now();
     auto& tokens = tokenizer.tokenize(query_to_parse, query_length, arena);
-    auto end = std::chrono::high_resolution_clock::now();
+    auto end_lex = std::chrono::high_resolution_clock::now();
     
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto lex_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_lex - start_lex);
     
-    std::cout << "Tokenization completed in " << duration.count() << " microseconds\n";
+    std::cout << "   Tokenization completed in " << lex_duration.count() << " microseconds\n";
+    std::cout << "   Generated " << tokens.size() << " tokens\n";
     
-    // Print the tokens
-    printTokens(tokens);
+    // Parse the tokens into AST
+    std::cout << "\n[2/2] Parsing tokens into AST...\n";
+    
+    // Convert pmr::vector to std::vector for parser
+    std::vector<Token> token_vec(tokens.begin(), tokens.end());
+    Parser parser(token_vec);
+    
+    auto start_parse = std::chrono::high_resolution_clock::now();
+    auto ast = parser.parse_document();
+    auto end_parse = std::chrono::high_resolution_clock::now();
+    
+    auto parse_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_parse - start_parse);
+    
+    std::cout << "   Parsing completed in " << parse_duration.count() << " microseconds\n";
+    
+    // Check for parsing errors
+    if (parser.has_errors()) {
+        std::cout << "\n" << std::string(68, '=') << "\n";
+        std::cout << "PARSING ERRORS:\n";
+        std::cout << std::string(68, '=') << "\n";
+        for (const auto& error : parser.get_errors()) {
+            std::cout << "  ERROR: " << error << "\n";
+        }
+        std::cout << std::string(68, '=') << "\n";
+    } else {
+        std::cout << "   No parsing errors!\n";
+    }
+    
+    // Print AST summary
+    if (ast) {
+        std::cout << "\n" << std::string(68, '=') << "\n";
+        std::cout << "AST STRUCTURE:\n";
+        std::cout << std::string(68, '=') << "\n";
+        printAST(*ast);
+        std::cout << std::string(68, '=') << "\n";
+    }
     
     // Print statistics
-    std::cout << "Statistics:\n";
-    std::cout << "  - Input size: " << query_length << " bytes\n";
-    std::cout << "  - Tokens generated: " << tokens.size() << "\n";
-    std::cout << "  - Time taken: " << duration.count() << " microseconds\n";
+    auto total_duration = lex_duration + parse_duration;
+    std::cout << "\n" << std::string(68, '=') << "\n";
+    std::cout << "PERFORMANCE SUMMARY:\n";
+    std::cout << std::string(68, '=') << "\n";
+    std::cout << "  Input size:      " << query_length << " bytes\n";
+    std::cout << "  Tokens:          " << tokens.size() << "\n";
+    std::cout << "  Lexing time:     " << lex_duration.count() << " µs\n";
+    std::cout << "  Parsing time:    " << parse_duration.count() << " µs\n";
+    std::cout << "  Total time:      " << total_duration.count() << " µs\n";
     
-    if (duration.count() > 0) {
-        std::cout << "  - Throughput: " << std::fixed << std::setprecision(2) 
-                  << (query_length / (duration.count() / 1000000.0) / 1024.0 / 1024.0) 
-                  << " MB/s\n\n";
+    if (total_duration.count() > 0) {
+        double throughput = (query_length / (total_duration.count() / 1000000.0)) / (1024.0 * 1024.0);
+        std::cout << "  Throughput:      " << std::fixed << std::setprecision(2) 
+                  << throughput << " MB/s\n";
     }
+    std::cout << std::string(68, '=') << "\n\n";
     
     std::cout << "Example usage:\n";
     std::cout << "  ./build/graphql_parser                  # Parse sample query\n";

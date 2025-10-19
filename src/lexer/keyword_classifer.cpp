@@ -58,10 +58,12 @@ TokenType classify_keyword(std::string_view sv) {
     switch (hash) {
         // 2-letter keywords
         case 0xd7274796: if (sv == "on") return TokenType::KEYWORD_ON; break;
-        case 0xcfd041c6: if (sv == "id") return TokenType::KEYWORD_ID; break;
+        // Removed: case 0xcfd041c6: if (sv == "id") return TokenType::KEYWORD_ID; break;
+        // "id" should be treated as regular identifier, not keyword
         
         // 3-letter keywords
-        case 0x5b91ec67: if (sv == "int") return TokenType::KEYWORD_INT; break;
+        // Removed: case 0x5b91ec67: if (sv == "int") return TokenType::KEYWORD_INT; break;
+        // "int" should be treated as regular identifier
         
         // 4-letter keywords
         case 0x28191240: if (sv == "null") return TokenType::KEYWORD_NULL; break;
@@ -71,18 +73,18 @@ TokenType classify_keyword(std::string_view sv) {
         
         // 5-letter keywords
         case 0x0f1ea48a: if (sv == "false") return TokenType::KEYWORD_FALSE; break;
-        case 0xb71eb5f1: if (sv == "float") return TokenType::KEYWORD_FLOAT; break;
+        // Removed: case 0xb71eb5f1: if (sv == "float") return TokenType::KEYWORD_FLOAT; break;
         case 0x0067774c: if (sv == "query") return TokenType::KEYWORD_QUERY; break;
         case 0xf722ba8d: if (sv == "__get") return TokenType::KEYWORD_GET; break;
         case 0xbc3d60fe: if (sv == "union") return TokenType::KEYWORD_UNION; break;
         case 0xf9601b2b: if (sv == "input") return TokenType::KEYWORD_INPUT; break;
         
         // 6-letter keywords
-        case 0xdd26a99f: if (sv == "string") return TokenType::KEYWORD_STRING; break;
+        // Removed: case 0xdd26a99f: if (sv == "string") return TokenType::KEYWORD_STRING; break;
         case 0x7a8ff6e6: if (sv == "scalar") return TokenType::KEYWORD_SCALAR; break;
         
         // 7-letter keywords
-        case 0xf1dd8306: if (sv == "boolean") return TokenType::KEYWORD_BOOLEAN; break;
+        // Removed: case 0xf1dd8306: if (sv == "boolean") return TokenType::KEYWORD_BOOLEAN; break;
         case 0xa79f840e: if (sv == "extends") return TokenType::KEYWORD_EXTEND; break;
         
         // 8-letter keywords
