@@ -53,6 +53,7 @@ __attribute__((always_inline)) inline size_t skip_comments_simd(const char* __re
 
   if (text[i] == '/' && text[i + 1] == '*') {
       i += 2;
+      size_t last_star_check = i;
 
       while (i + 32 <= text_len) {
           __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
@@ -70,8 +71,13 @@ __attribute__((always_inline)) inline size_t skip_comments_simd(const char* __re
               }
           }
 
-          i += 31; // Overlap one byte in case '*' is at the boundary
+          // FIX: Advance from last checked position to avoid missing boundary case
+          last_star_check = i + 32;
+          i += 32;
       }
+      
+      // Set i back to continue from last star check
+      i = last_star_check;
 
       // Final tail scan
       while (i + 1 < text_len) {
@@ -126,9 +132,15 @@ std::pmr::vector<Token>& Tokenizer::tokenize(const char* text,
                 );
                 
                 uint32_t ws_bits = _mm256_movemask_epi8(whitespace_mask);
-                unsigned int skip = __builtin_ctz(~ws_bits | (ws_bits == 0xFFFFFFFF ? 0 : 0));
-                i += skip;
-                break;
+                
+                // FIX: Only break if we found non-whitespace
+                if (ws_bits != 0xFFFFFFFF) {
+                    unsigned int skip = __builtin_ctz(~ws_bits);
+                    i += skip;
+                    break;
+                }
+                // All whitespace, continue to next chunk
+                i += 32;
             }
         } 
         
@@ -258,127 +270,151 @@ std::pmr::vector<Token>& Tokenizer::tokenize(const char* text,
             continue;
         }
         
-        // Fast path for numbers with SIMD
-        if (__builtin_expect(getCharLookup().hasFlag(c, CharLookup::DIGIT_FLAG), 0)) {
-            size_t start = i++;
-            size_t len = 1;
+        // Fast path for numbers with SIMD (including negative numbers)
+        if (__builtin_expect(getCharLookup().hasFlag(c, CharLookup::DIGIT_FLAG) || 
+            (c == '-' && i + 1 < text_len && getCharLookup().hasFlag(text[i + 1], CharLookup::DIGIT_FLAG)), 0)) {
+            size_t start = i;
             bool has_decimal = false;
+            bool has_exponent = false;
             
-            // Special handling for numbers with SIMD
+            // Handle negative sign
+            if (c == '-') {
+                i++;
+            }
+            
+            // Integer part - use SIMD for bulk scanning
             while (i + 32 <= text_len) {
                 __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
                 
-                // Check for digits and decimal point
+                // Check for digits only (no decimals in this pass)
                 __m256i is_digit = _mm256_and_si256(
                     _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8('0' - 1)),
                     _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), chunk)
                 );
                 
-                // Handle decimal point separately to avoid multiple decimal points
-                if (!has_decimal) {
-                    __m256i is_decimal = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8('.'));
-                    uint32_t decimal_bits = _mm256_movemask_epi8(is_decimal);
-                    if (decimal_bits != 0) {
-                        unsigned int pos = __builtin_ctz(decimal_bits);
-                        if (pos < 32) {
-                            has_decimal = true;
-                        }
-                    }
-                    is_digit = _mm256_or_si256(is_digit, is_decimal);
-                }
-                
                 uint32_t digit_bits = _mm256_movemask_epi8(is_digit);
                 
-                if (__builtin_expect(digit_bits == 0xFFFFFFFF, 0)) {
-                    // All 32 bytes are digits or one decimal point
+                if (digit_bits == 0xFFFFFFFF) {
                     i += 32;
-                    len += 32;
                     continue;
                 }
                 
-                // Find first non-digit
+                // Found non-digit
                 unsigned int pos = __builtin_ctz(~digit_bits);
                 i += pos;
-                len += pos;
                 break;
             }
             
-            // Process remaining bytes
+            // Process remaining bytes (decimals, exponents)
             while (i < text_len) {
                 c = text[i];
                 if (c >= '0' && c <= '9') {
                     i++;
-                    len++;
-                } else if (c == '.' && !has_decimal) {
+                } else if (c == '.' && !has_decimal && !has_exponent) {
+                    // FIX: Ensure only one decimal point and not after exponent
                     has_decimal = true;
                     i++;
-                    len++;
+                } else if ((c == 'e' || c == 'E') && !has_exponent) {
+                    // Scientific notation
+                    has_exponent = true;
+                    i++;
+                    // Optional sign after exponent
+                    if (i < text_len && (text[i] == '+' || text[i] == '-')) {
+                        i++;
+                    }
                 } else {
                     break;
                 }
             }
             
-            tokens.emplace_back(TokenType::NUMBER, std::string_view(text + start, len), start);
+            tokens.emplace_back(TokenType::NUMBER, std::string_view(text + start, i - start), start);
             continue;
         }
         
-        // Handle string literals
+        // Handle string literals (including block strings)
         if (__builtin_expect(getCharLookup().hasFlag(c, CharLookup::STRING_DELIM_FLAG), 0)) {
             char quote_char = c;
-            size_t start = i++;
+            size_t start = i;
+            bool escaped = false;  // Declare at top to avoid goto issues
             
-            // SIMD-accelerated string scan
-            __m256i quote_v = _mm256_set1_epi8(quote_char);
-            __m256i escape_v = _mm256_set1_epi8('\\');
-
+            // Check for block string (triple quotes)
+            if (i + 2 < text_len && text[i + 1] == quote_char && text[i + 2] == quote_char) {
+                i += 3;
+                
+                // Block string - scan for closing triple quotes
+                while (i + 2 < text_len) {
+                    if (text[i] == quote_char && text[i + 1] == quote_char && text[i + 2] == quote_char) {
+                        i += 3;
+                        tokens.emplace_back(TokenType::STRING, std::string_view(text + start, i - start), start);
+                        goto string_done;
+                    }
+                    // Block strings can contain unescaped quotes and newlines
+                    i++;
+                }
+                // ERROR: Unterminated block string
+                tokens.emplace_back(TokenType::UNKNOWN, std::string_view(text + start, i - start), start);
+                continue;
+            }
+            
+            // Regular string - use improved escape tracking
+            i++;
+            
+            // SIMD-accelerated scan for regular strings
             while (i + 32 <= text_len) {
                 __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text + i));
+                __m256i quote_v = _mm256_set1_epi8(quote_char);
+                __m256i escape_v = _mm256_set1_epi8('\\');
+                __m256i newline_v = _mm256_set1_epi8('\n');
+                
                 uint32_t quote_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, quote_v));
                 uint32_t escape_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, escape_v));
+                uint32_t newline_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newline_v));
                 
-                if (quote_mask) {
-                    // Find first unescaped quote
-                    while (quote_mask) {
-                        uint32_t quote_pos = __builtin_ctz(quote_mask);
-                        
-                        // Check if it's escaped (preceded by odd number of backslashes)
-                        bool is_escaped = false;
-                        if (i + quote_pos > start + 1) {
-                            size_t check_pos = i + quote_pos - 1;
-                            int backslash_count = 0;
-                            while (check_pos > start && text[check_pos] == '\\') {
-                                backslash_count++;
-                                check_pos--;
-                            }
-                            is_escaped = (backslash_count % 2 == 1);
-                        }
-                        
-                        if (!is_escaped) {
-                            i += quote_pos + 1; // Include closing quote
-                            tokens.emplace_back(TokenType::STRING, std::string_view(text + start, i - start), start);
-                            goto string_done;
-                        }
-                        
-                        quote_mask &= quote_mask - 1;
-                    }
+                // ERROR: Unescaped newline in string
+                if (newline_mask) {
+                    unsigned int nl_pos = __builtin_ctz(newline_mask);
+                    i += nl_pos;
+                    tokens.emplace_back(TokenType::UNKNOWN, std::string_view(text + start, i - start), start);
+                    goto string_done;
+                }
+                
+                // Look for unescaped quote
+                if (quote_mask || escape_mask) {
+                    // Fall back to scalar for this chunk (complex escape handling)
+                    break;
                 }
                 
                 i += 32;
             }
             
-            // Fallback to scalar processing
+            // Scalar processing with proper escape tracking
             while (i < text_len) {
-                if (text[i] == '\\' && i + 1 < text_len) {
-                    i += 2; // Skip escape sequence
-                } else if (text[i] == quote_char) {
+                char ch = text[i];
+                
+                if (escaped) {
+                    escaped = false;
+                    i++;
+                    continue;
+                }
+                
+                if (ch == '\\') {
+                    escaped = true;
+                    i++;
+                } else if (ch == quote_char) {
                     i++; // Include closing quote
-                    break;
+                    tokens.emplace_back(TokenType::STRING, std::string_view(text + start, i - start), start);
+                    goto string_done;
+                } else if (ch == '\n') {
+                    // ERROR: Unterminated string (newline)
+                    tokens.emplace_back(TokenType::UNKNOWN, std::string_view(text + start, i - start), start);
+                    goto string_done;
                 } else {
                     i++;
                 }
             }
             
-            tokens.emplace_back(TokenType::STRING, std::string_view(text + start, i - start), start);
+            // ERROR: Unterminated string (EOF)
+            tokens.emplace_back(TokenType::UNKNOWN, std::string_view(text + start, i - start), start);
             string_done:
             continue;
         }
